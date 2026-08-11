@@ -1,0 +1,34 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+.env.*
+
+# Node
+node_modules/
+dist/
+.next/
+
+# Database
+*.sqlite
+*.sqlite3
+
+# OAuth
+token.json
+credentials.json
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

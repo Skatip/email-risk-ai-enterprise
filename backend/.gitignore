@@ -1,0 +1,25 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+.env.*
+
+# Databases
+*.sqlite
+*.sqlite3
+
+# OAuth
+token.json
+credentials.json
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
