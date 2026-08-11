@@ -1,34 +1,22 @@
-# Python
+.env
+.env.*
+!.env.example
 venv/
 .venv/
+node_modules/
 __pycache__/
 *.pyc
 *.pyo
-
-# Environment
-.env
-.env.*
-
-# Node
-node_modules/
-dist/
-.next/
-
-# Database
 *.sqlite
 *.sqlite3
-
-# OAuth
 token.json
 credentials.json
-
-# Logs
-*.log
-
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
+dist/
+build/
+.next/
+coverage/
+.pytest_cache/
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db

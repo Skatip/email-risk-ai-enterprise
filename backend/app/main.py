@@ -9,11 +9,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.db import init_db, kv_get, kv_set, upsert_sender
-from app.gmail_service import fetch_emails, fetch_full_thread, fetch_inbox_fast, fetch_email_body, fetch_gmail_attachment, create_reply_draft
-from app.outlook_service import fetch_outlook_emails
-from app.priority_engine import priority_score
-from app.utils import parse_sender
+from app.db import init_db, kv_get, kv_set
+from app.gmail_service import fetch_full_thread, fetch_inbox_fast, fetch_email_body, fetch_gmail_attachment, create_reply_draft
+from app.calendar_service import free_busy
 from app.reply_agent import save_rag_example, load_reply_memories
 from app.communication_brain.orchestrator import process_communication
 from app.communication_brain.triage import triage_messages, analyze_message_semantics
@@ -21,7 +19,7 @@ from app.api.google_oauth import router as google_oauth_router
 from app.api.mcp_tools import router as mcp_tools_router
 from app.integration_store import init_integration_store
 from app.reply_multi import generate_multi
-from app.learning import predict_user_preference, apply_user_override, record_feedback
+from app.learning import record_feedback
 from app.thread_summary_agent import summarize_thread
 from app.compose_from_notes_agent import write_from_notes
 from app.analytics_service import track_email_event, get_analytics_summary
@@ -170,7 +168,8 @@ def _startup():
 async def inbox_fast(
     user_email: str = Query(default=""),
     query: str = Query(default=""),
-    max_results: int = Query(default=10),
+    max_results: int = Query(default=12),
+    bucket: str = Query(default="IMPORTANT"),
     provider: str = Query(default="gmail"),
     user_id: str = Query(default=""),
 ):
@@ -179,28 +178,23 @@ async def inbox_fast(
     Fetches a bounded Primary + Spam candidate pool, then uses one compact semantic
     triage call to rank direct human and important messages before returning cards.
     """
-    cache_key = f"inbox|{user_id}|{provider}|{user_email}|{query}|{max_results}"
+    cache_key = f"inbox|{user_id}|{provider}|{user_email}|{query}|{bucket}|{max_results}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
     try:
         if provider == "outlook":
-            app_pwd = os.getenv("OUTLOOK_APP_PASSWORD")
-            if not app_pwd:
-                raise HTTPException(status_code=500, detail="OUTLOOK_APP_PASSWORD not found in .env")
-            raw = await asyncio.to_thread(
-                fetch_outlook_emails,
-                email_user=user_email,
-                app_password=app_pwd,
-                max_results=max_results,
+            raise HTTPException(
+                status_code=501,
+                detail="Outlook is intentionally disabled until Microsoft OAuth is configured; app-password login is not supported.",
             )
         else:
             raw = await asyncio.to_thread(
                 fetch_inbox_fast,
                 query=_effective_query(query),
-                max_results=max(max_results * 4, 40),
-                scan_limit=max(max_results * 10, 100),
+                max_results=max(max_results * 3, 36),
+                scan_limit=max(max_results * 6, 72),
                 user_id=user_id,
             )
     except HTTPException:
@@ -251,7 +245,13 @@ async def inbox_fast(
             "inbox_score": float(semantic.get("inbox_score", priority) or 0.0),
             "label": semantic.get("label") or "PENDING",
             "risk": float(semantic.get("risk", 0.0) or 0.0),
-            "sender_band": "HUMAN" if semantic.get("direct_human") else ("AUTOMATED" if sender_type == "AUTOMATED" else "UNKNOWN"),
+            "sender_band": (
+                "HUMAN" if semantic.get("direct_human")
+                else "AUTOMATED" if sender_type == "AUTOMATED"
+                else "COMPANY" if sender_type == "COMPANY"
+                else "PERSONAL" if sender_type == "PERSONAL"
+                else "UNKNOWN"
+            ),
             "sender_type": sender_type,
             "intent": semantic.get("intent") or "pending",
             "reason": semantic.get("reason") or "Awaiting deeper analysis.",
@@ -266,6 +266,8 @@ async def inbox_fast(
             "human_signals": {"sender_type": sender_type},
             "analysis_status": "triaged" if semantic else "pending",
             "source_folder": e.get("source_folder", ""),
+            "bucket": semantic.get("bucket") or "INFORMATIONAL",
+            "communication_type": semantic.get("communication_type") or "AUTOMATED",
             "email_type": semantic.get("email_type") or "UNCLASSIFIED",
             "relationship_type": semantic.get("relationship_type") or "UNKNOWN",
             "basic_classification": e.get("basic_classification", {}),
@@ -276,6 +278,14 @@ async def inbox_fast(
         out.sort(key=lambda x: (float(x.get("inbox_score", 0.0)), float(x.get("priority", 0.0)), int(x.get("ts", 0))), reverse=True)
     else:
         out.sort(key=lambda x: int(x.get("ts", 0)), reverse=True)
+
+    requested_bucket = (bucket or "IMPORTANT").upper()
+    if requested_bucket == "IMPORTANT":
+        important_buckets = {"IMPORTANT_NOW", "CONVERSATIONAL", "BUSINESS", "RECRUITING", "SECURITY", "FOLLOW_UP", "TRANSACTIONAL"}
+        threshold = float(os.getenv("IMPORTANT_INBOX_MIN_SCORE", "0.38"))
+        out = [x for x in out if x.get("bucket") in important_buckets and (float(x.get("inbox_score", 0)) >= threshold or x.get("requires_action") or x.get("direct_human") or x.get("security_event"))]
+    elif requested_bucket != "ALL":
+        out = [x for x in out if str(x.get("bucket") or "").upper() == requested_bucket]
 
     out = out[:max_results]
     _cache_set(cache_key, out)
@@ -300,12 +310,39 @@ async def email_analyze(payload: Dict[str, Any] = Body(...)):
             except Exception as body_err:
                 print(f"Analyze body fetch warning: {body_err}")
 
-        semantic = await asyncio.to_thread(analyze_message_semantics, email, payload.get("analysis") or email)
+        # Deep analysis must see the real conversation, not an isolated snippet.
+        thread: List[Dict[str, Any]] = payload.get("thread") or []
+        if provider == "gmail" and email.get("threadId") and user_id and not thread:
+            try:
+                thread = await asyncio.to_thread(fetch_full_thread, email.get("threadId"), user_id)
+            except Exception as thread_err:
+                print(f"Analyze thread fetch warning: {thread_err}")
+
+        # Attachments are first-class context. Analyze all real attachments once and
+        # reuse the SHA-256 cache. Provider-generated HTML body artifacts are filtered
+        # in gmail_service before this point.
+        attachment_result: Dict[str, Any] = {}
+        attachment_context = payload.get("attachment_context") or email.get("attachment_analysis") or []
+        if provider == "gmail" and user_id and email.get("attachments") and not attachment_context:
+            try:
+                attachment_result = await _analyze_all_email_attachments(email, user_id)
+                attachment_context = attachment_result.get("attachment_analysis") or []
+            except Exception as attachment_err:
+                print(f"Analyze attachment warning: {attachment_err}")
+
+        semantic = await asyncio.to_thread(
+            analyze_message_semantics,
+            email,
+            payload.get("analysis") or email,
+            thread=thread,
+            attachment_context=attachment_context,
+        )
 
         item = {
             **email,
             **semantic,
             "provider": provider,
+            "user_id": user_id,
             "analysis_status": "done",
             "source_folder": email.get("source_folder", ""),
             "attachments": email.get("attachments", []),
@@ -317,13 +354,10 @@ async def email_analyze(payload: Dict[str, Any] = Body(...)):
             "risk_signals": [],
             "risk_reasons": [semantic.get("security_reason")] if semantic.get("security_event") and semantic.get("security_reason") else [],
             "risk_urls": [],
+            "attachment_analysis": attachment_result.get("attachment_analysis") or attachment_context or email.get("attachment_analysis") or [],
+            "attachment_bundle": attachment_result.get("attachment_bundle") or email.get("attachment_bundle") or {},
+            "attachment_reply_context": attachment_result.get("attachment_reply_context") or email.get("attachment_reply_context") or "",
         }
-
-        try:
-            name, sender_email = parse_sender(email.get("from", ""))
-            upsert_sender(sender_email, name, float(item.get("priority", 0.0)), item.get("label", "LOW"), int(email.get("ts", 0)))
-        except Exception:
-            pass
 
         try:
             track_email_event(item)
@@ -432,6 +466,26 @@ async def reply_generate(payload: Dict[str, Any] = Body(...)):
             memories=memories,
             user_preferences=user_preferences,
         )
+        # Tool-gated scheduling: the brain may request a read-only calendar lookup.
+        # We never invent availability and never create an event automatically.
+        if result.get("decision") == "CHECK_CALENDAR" and user_id:
+            req = result.get("tool_request") or {}
+            if req.get("time_min") and req.get("time_max"):
+                try:
+                    availability = await asyncio.to_thread(free_busy, user_id, req["time_min"], req["time_max"])
+                    prefs_with_tool = {**user_preferences, "calendar_availability": availability}
+                    result = await asyncio.to_thread(
+                        process_communication, email, analysis, force=force, thread=thread,
+                        attachment_context=combined_attachment_context, memories=memories,
+                        user_preferences=prefs_with_tool,
+                    )
+                    result["calendar_checked"] = True
+                    result["calendar_availability"] = availability
+                except Exception as calendar_err:
+                    result["decision"] = "ASK_USER"
+                    result["reply"] = ""
+                    result["clarification_question"] = "I need your calendar availability to answer this scheduling request accurately. Please reconnect Google Calendar or tell me what times work for you."
+                    result["calendar_error"] = str(calendar_err)
         result["attachment_analysis"] = attachment_context
         result["attachment_bundle"] = attachment_bundle
         return result
@@ -596,9 +650,9 @@ def compose_notes(payload: Dict[str, Any] = Body(...)):
 
 
 @app.get("/analytics")
-def analytics(days: int = Query(default=14)):
+def analytics(days: int = Query(default=14), user_id: str = Query(default="")):
     try:
-        return get_analytics_summary(days=days)
+        return get_analytics_summary(days=days, user_id=user_id)
     except TypeError:
         return get_analytics_summary()
     except Exception as e:

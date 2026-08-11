@@ -6,6 +6,7 @@ import zipfile
 from typing import Any, Dict, List
 
 from app.attachment_llm_summary import summarize_attachment_with_llm
+from app.ai.provider import get_ai_provider
 
 RISKY_EXTENSIONS = {
     ".exe", ".bat", ".cmd", ".scr", ".js", ".vbs", ".ps1", ".msi", ".jar", ".com"
@@ -68,6 +69,75 @@ DOC_LABELS = {
     "risky_executable": "Risky File",
 }
 
+
+
+VISION_OCR_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "text": {"type": "string"},
+        "readable": {"type": "boolean"},
+        "notes": {"type": "string"},
+    },
+    "required": ["text", "readable", "notes"],
+}
+
+
+def _pil_to_data_url(img: Any) -> str:
+    try:
+        from PIL import Image
+        out = io.BytesIO()
+        if getattr(img, "mode", "RGB") not in {"RGB", "L"}:
+            img = img.convert("RGB")
+        img.save(out, format="JPEG", quality=88, optimize=True)
+        return get_ai_provider().bytes_to_data_url(out.getvalue(), "image/jpeg")
+    except Exception:
+        return ""
+
+
+def _vision_ocr_images(images: List[Any], filename: str) -> str:
+    urls = [_pil_to_data_url(img) for img in images[:3]]
+    urls = [u for u in urls if u]
+    if not urls:
+        return ""
+    try:
+        result = get_ai_provider().generate_json_with_images(
+            system=(
+                "You are an OCR/document-reading layer. Read all visible text faithfully from the supplied document page(s). "
+                "Preserve names, dates, amounts, IDs, headings, questions, and action language. Do not summarize or invent. "
+                "Ignore decorative logos when they contain no meaningful text."
+            ),
+            user_text=f"OCR the attachment named {filename}. Return the readable text in natural reading order.",
+            image_data_urls=urls,
+            max_tokens=int(os.getenv("VISION_OCR_MAX_TOKENS", "1800")),
+            temperature=0.0,
+            schema=VISION_OCR_SCHEMA,
+            schema_name="document_ocr",
+        )
+        if result.get("readable") and str(result.get("text") or "").strip():
+            return _safe_text(str(result.get("text") or ""))
+    except Exception as exc:
+        print(f"Vision OCR fallback warning for {filename}: {exc}")
+    return ""
+
+
+def _vision_ocr_attachment(filename: str, mime_type: str, data: bytes, file_type: str) -> str:
+    """Hosted OCR fallback for Render when native extraction/Tesseract cannot read a scan."""
+    if os.getenv("ENABLE_VISION_OCR_FALLBACK", "true").lower() != "true":
+        return ""
+    if file_type == "pdf":
+        images = _render_pdf_with_pymupdf(data, max_pages=ATTACHMENT_OCR_PAGES)
+        if not images:
+            images = _render_pdf_with_pypdfium2(data, max_pages=ATTACHMENT_OCR_PAGES)
+        return _vision_ocr_images(images, filename)
+    if file_type == "image":
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(data))
+            return _vision_ocr_images([img], filename)
+        except Exception:
+            return ""
+    return ""
 
 def _ext(filename: str) -> str:
     name = (filename or "").lower().strip()
@@ -476,9 +546,7 @@ def _summary_from_fields(file_type: str, doc: Dict[str, Any], extracted: str, da
             prefix += f"Action likely needed. "
         return prefix + first
     return (
-        f"{label} attachment detected, but readable text was not available. "
-        "If this is a scanned PDF/image, install Tesseract OCR and one PDF renderer: PyMuPDF or pypdfium2. "
-        "On Windows, set TESSERACT_CMD if Tesseract is not in PATH."
+        f"{label} attachment detected, but readable text could not be recovered by native extraction or the hosted OCR fallback."
     )
 
 
@@ -514,6 +582,19 @@ def analyze_attachment_bytes(
         }
 
     extracted = extract_attachment_text(filename, mime_type, data)
+    # Native parsers are cheapest and preferred. For scanned PDFs/images on hosted
+    # Render instances, Tesseract may not be installed; use a bounded OpenAI vision
+    # OCR fallback only when meaningful text was not recovered.
+    needs_vision = file_type in {"pdf", "image"} and (
+        not extracted.strip()
+        or "OCR text was not available" in extracted
+        or (file_type == "image" and not _meaningful_image_text(extracted))
+    )
+    if needs_vision:
+        vision_text = _vision_ocr_attachment(filename, mime_type, data, file_type)
+        if vision_text.strip():
+            extracted = vision_text
+
     doc = detect_document_type(filename, file_type, extracted)
     dates = _find_dates(extracted)
     amounts = _find_amounts(extracted)

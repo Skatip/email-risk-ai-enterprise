@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import secrets
 import time
 from typing import Any, Dict, Optional
 
@@ -27,6 +29,13 @@ def _fernet() -> Fernet:
 def init_integration_store() -> None:
     with psycopg.connect(_database_url()) as connection:
         with connection.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS oauth_states(
+                state_hash TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                expires_at BIGINT NOT NULL,
+                created_at BIGINT NOT NULL
+            )""")
             cur.execute("""CREATE TABLE IF NOT EXISTS integration_connections(
                 id BIGSERIAL PRIMARY KEY,
                 user_id TEXT NOT NULL,
@@ -93,3 +102,40 @@ def delete_connection(user_id: str, provider: str, account_email: str | None = N
         with connection.cursor() as cur:
             cur.execute(query, params)
         connection.commit()
+
+def create_oauth_state(user_id: str, provider: str, ttl_seconds: int = 600) -> str:
+    if not user_id:
+        raise ValueError("user_id is required")
+    init_integration_store()
+    token = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    now = int(time.time())
+    with psycopg.connect(_database_url()) as connection:
+        with connection.cursor() as cur:
+            cur.execute("DELETE FROM oauth_states WHERE expires_at < %s", (now,))
+            cur.execute(
+                "INSERT INTO oauth_states(state_hash,user_id,provider,expires_at,created_at) VALUES(%s,%s,%s,%s,%s)",
+                (digest, user_id, provider, now + max(60, int(ttl_seconds)), now),
+            )
+        connection.commit()
+    return token
+
+
+def consume_oauth_state(token: str, provider: str) -> str:
+    if not token:
+        raise ValueError("OAuth state is missing")
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    now = int(time.time())
+    with psycopg.connect(_database_url(), row_factory=dict_row) as connection:
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT user_id,expires_at FROM oauth_states WHERE state_hash=%s AND provider=%s",
+                (digest, provider),
+            )
+            row = cur.fetchone()
+            cur.execute("DELETE FROM oauth_states WHERE state_hash=%s", (digest,))
+        connection.commit()
+    if not row or int(row["expires_at"] or 0) < now:
+        raise ValueError("OAuth state is invalid or expired")
+    return str(row["user_id"])
+

@@ -1,8 +1,9 @@
 import json
 import os
 import re
-import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
+
+from app.ai.provider import get_ai_provider
 
 DOCUMENT_TYPES = [
     "Offer Letter", "Contract", "Invoice", "Resume", "Certificate", "Tax Document",
@@ -43,6 +44,27 @@ Return JSON with exactly these keys:
   "confidence": 0.90
 }
 """.strip()
+
+ATTACHMENT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "document_type": {"type": "string"},
+        "title": {"type": "string"},
+        "summary": {"type": "string"},
+        "key_details": {"type": "array", "items": {"type": "string"}},
+        "action_items": {"type": "array", "items": {"type": "string"}},
+        "dates": {"type": "array", "items": {"type": "string"}},
+        "amounts": {"type": "array", "items": {"type": "string"}},
+        "ids": {"type": "array", "items": {"type": "string"}},
+        "action_required": {"type": "boolean"},
+        "business_value": {"type": "string"},
+        "priority_reason": {"type": "string"},
+        "reply_context": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": ["document_type", "title", "summary", "key_details", "action_items", "dates", "amounts", "ids", "action_required", "business_value", "priority_reason", "reply_context", "confidence"],
+}
 
 LEGAL_NOISE_PATTERNS = [
     r"the .*? logo is a registered mark of .*?(?:inc\.|llc|ltd|corporation|institute).*?",
@@ -438,22 +460,19 @@ Return ONLY valid JSON. Do not include markdown.
 
 
 def _call_openai(prompt: str) -> Optional[Dict[str, Any]]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+    if not os.getenv("OPENAI_API_KEY"):
         return None
-    model = os.getenv("ATTACHMENT_OPENAI_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-    body = json.dumps({
-        "model": model,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
-        "temperature": 0.05,
-        "response_format": {"type": "json_object"},
-    }).encode("utf-8")
-    req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=body, headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=int(os.getenv("ATTACHMENT_LLM_TIMEOUT", "20"))) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
-        return _safe_json_loads(payload["choices"][0]["message"]["content"])
-    except Exception:
+        return get_ai_provider().generate_json(
+            system=SYSTEM_PROMPT,
+            user={"document_context": prompt},
+            max_tokens=int(os.getenv("ATTACHMENT_LLM_MAX_TOKENS", "1200")),
+            temperature=0.05,
+            schema=ATTACHMENT_SCHEMA,
+            schema_name="attachment_intelligence",
+        )
+    except Exception as exc:
+        print(f"Attachment intelligence warning: {exc}")
         return None
 
 

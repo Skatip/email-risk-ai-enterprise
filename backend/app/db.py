@@ -63,11 +63,6 @@ def init_db() -> None:
     conn = connect()
     cur = conn.cursor()
     statements = [
-        """CREATE TABLE IF NOT EXISTS sender_stats(
-            sender_email TEXT PRIMARY KEY, sender_name TEXT, total_count INTEGER DEFAULT 0,
-            high_count INTEGER DEFAULT 0, medium_count INTEGER DEFAULT 0, low_count INTEGER DEFAULT 0,
-            avg_priority DOUBLE PRECISION DEFAULT 0, last_seen_ts BIGINT DEFAULT 0,
-            vip INTEGER DEFAULT 0, blocked INTEGER DEFAULT 0)""",
         """CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)""",
         """CREATE TABLE IF NOT EXISTS followup_reminders(
             id BIGSERIAL PRIMARY KEY, user_id TEXT DEFAULT '', email_id TEXT, thread_id TEXT,
@@ -105,32 +100,3 @@ def kv_set(key: str, value: str) -> None:
     conn = connect(); cur = conn.cursor()
     cur.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=EXCLUDED.v", (key, value))
     conn.commit(); conn.close()
-
-
-def upsert_sender(sender_email: str, sender_name: str, priority: float, label: str, ts: int) -> None:
-    conn = connect(); cur = conn.cursor()
-    cur.execute("SELECT * FROM sender_stats WHERE sender_email=?", (sender_email,)); row = cur.fetchone()
-    high, med, low = int(label == "HIGH"), int(label == "MEDIUM"), int(label == "LOW")
-    if not row:
-        cur.execute("INSERT INTO sender_stats(sender_email,sender_name,total_count,high_count,medium_count,low_count,avg_priority,last_seen_ts) VALUES(?,?,?,?,?,?,?,?)", (sender_email, sender_name, 1, high, med, low, float(priority), int(ts)))
-    else:
-        total = int(row["total_count"]) + 1
-        new_avg = float(row["avg_priority"]) + (float(priority) - float(row["avg_priority"])) / total
-        cur.execute("UPDATE sender_stats SET sender_name=?,total_count=?,high_count=high_count+?,medium_count=medium_count+?,low_count=low_count+?,avg_priority=?,last_seen_ts=GREATEST(last_seen_ts,?) WHERE sender_email=?", (sender_name, total, high, med, low, new_avg, int(ts), sender_email))
-    conn.commit(); conn.close()
-
-
-def set_sender_flag(sender_email: str, vip: Optional[int] = None, blocked: Optional[int] = None) -> None:
-    conn = connect(); cur = conn.cursor()
-    cur.execute("INSERT INTO sender_stats(sender_email) VALUES(?) ON CONFLICT(sender_email) DO NOTHING", (sender_email,))
-    if vip is not None: cur.execute("UPDATE sender_stats SET vip=? WHERE sender_email=?", (int(vip), sender_email))
-    if blocked is not None: cur.execute("UPDATE sender_stats SET blocked=? WHERE sender_email=?", (int(blocked), sender_email))
-    conn.commit(); conn.close()
-
-
-def get_sender(sender_email: str) -> Optional[Dict[str, Any]]:
-    conn = connect(); cur = conn.cursor(); cur.execute("SELECT * FROM sender_stats WHERE sender_email=?", (sender_email,)); row = cur.fetchone(); conn.close(); return dict(row) if row else None
-
-
-def top_senders(limit: int = 20) -> List[Dict[str, Any]]:
-    conn = connect(); cur = conn.cursor(); cur.execute("SELECT sender_email,sender_name,total_count,high_count,avg_priority,vip,blocked FROM sender_stats ORDER BY high_count DESC,avg_priority DESC,total_count DESC LIMIT ?", (limit,)); rows = cur.fetchall(); conn.close(); return [dict(r) for r in rows]

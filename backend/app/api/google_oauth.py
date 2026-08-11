@@ -9,6 +9,8 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
 from app.integration_store import (
+    create_oauth_state,
+    consume_oauth_state,
     delete_connection,
     get_connection,
     save_connection,
@@ -26,6 +28,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/calendar.readonly",
 ]
 
 GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
@@ -72,16 +75,16 @@ def connect(user_id: str = Query(..., min_length=1)):
     """
     Start the Google OAuth flow.
 
-    For local/private testing, user_id is passed in the state value.
-    Before public release, replace this with a random, expiring,
-    server-stored OAuth state token.
+    The browser user id is never used directly as OAuth state. A random, expiring,
+    single-use server-side state token protects the callback from CSRF/replay.
     """
     flow = _create_flow()
+    oauth_state = create_oauth_state(user_id, "google")
 
     authorization_url, _ = flow.authorization_url(
         access_type="offline",
         prompt="consent",
-        state=user_id,
+        state=oauth_state,
     )
 
     return RedirectResponse(
@@ -116,6 +119,11 @@ def callback(
             status_code=400,
             detail="Google OAuth callback is missing code or state.",
         )
+
+    try:
+        user_id = consume_oauth_state(state, "google")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Google OAuth state is invalid or expired. Please reconnect Gmail.") from exc
 
     flow = _create_flow()
 
@@ -191,7 +199,7 @@ def callback(
         )
 
     save_connection(
-        state,
+        user_id,
         "google",
         account_email,
         {

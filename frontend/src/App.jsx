@@ -22,6 +22,7 @@ const PROVIDERS = [
     logo: "gmail",
     email: import.meta.env.VITE_GMAIL_USER || "",
     color: "gmail",
+    enabled: true,
     description:
       "Analyze Gmail inbox with priority, risk, replies, summaries, and reminders.",
   },
@@ -31,8 +32,9 @@ const PROVIDERS = [
     logo: "outlook",
     email: import.meta.env.VITE_OUTLOOK_USER || "",
     color: "outlook",
+    enabled: false,
     description:
-      "Analyze Outlook inbox. Slack and Jira can be added later.",
+      "Microsoft OAuth connection is coming next. No app passwords or manual keys will be required.",
   },
 ];
 
@@ -181,7 +183,8 @@ function LandingPage({
           {PROVIDERS.map((p) => (
             <button
               key={p.id}
-              className={`providerTile ${p.color}`}
+              className={`providerTile ${p.color}${p.enabled === false ? " disabled" : ""}`}
+              disabled={p.enabled === false}
               onClick={() =>
                 p.id === "gmail"
                   ? onConnectGmail()
@@ -505,7 +508,7 @@ export default function App() {
   const [
     labelFilter,
     setLabelFilter,
-  ] = useState("ALL");
+  ] = useState("IMPORTANT");
 
   const [
     maxResults,
@@ -664,6 +667,7 @@ export default function App() {
             activeEmail,
           provider,
           userId,
+          bucket: ["ATTACHMENTS","INVOICE","CONTRACT","OFFER_LETTER","RESUME","TAX_DOCUMENT"].includes(labelFilter) ? "ALL" : labelFilter,
         });
 
       const next =
@@ -682,11 +686,8 @@ export default function App() {
             null
       );
 
-      /*
-       * Do not block inbox display.
-       * Analysis runs after rendering.
-       */
-      analyzeVisibleEmails(next);
+      // Fast path ends here. Full body/thread/OCR analysis is intentionally lazy:
+      // it runs only when the user opens a message or requests a reply/action.
     } catch (e) {
       setErr(
         String(
@@ -699,107 +700,17 @@ export default function App() {
     }
   }
 
-  async function analyzeVisibleEmails(
-    list
-  ) {
-    /*
-     * Speed-first:
-     * render inbox immediately,
-     * then analyze only a small visible batch.
-     */
-    const autoLimit = Number(
-      import.meta.env
-        .VITE_AUTO_ANALYZE_LIMIT ||
-        3
-    );
-
-    const batch = (
-      list || []
-    ).slice(
-      0,
-      Math.min(
-        Number(
-          maxResults || 10
-        ),
-        autoLimit
-      )
-    );
-
-    /*
-     * Allow the browser to paint
-     * the inbox first.
-     */
-    await new Promise(
-      (resolve) =>
-        setTimeout(
-          resolve,
-          150
-        )
-    );
-
-    for (const email of batch) {
-      if (
-        !email?.id ||
-        email.analysis_status ===
-          "done"
-      ) {
-        continue;
-      }
-
-      try {
-        setItems((prev) =>
-          prev.map((x) =>
-            x.id === email.id
-              ? {
-                  ...x,
-                  analysis_status:
-                    "loading",
-                }
-              : x
-          )
-        );
-
-        const analyzed =
-          await analyzeEmail({
-            email,
-            provider,
-            user_email:
-              activeEmail,
-            user_id:
-              userId,
-          });
-
-        setItems((prev) =>
-          prev.map((x) =>
-            x.id === email.id
-              ? {
-                  ...x,
-                  ...analyzed,
-                  analysis_status:
-                    "done",
-                }
-              : x
-          )
-        );
-      } catch (e) {
-        console.error(
-          "Email analysis failed:",
-          email?.id,
-          e
-        );
-
-        setItems((prev) =>
-          prev.map((x) =>
-            x.id === email.id
-              ? {
-                  ...x,
-                  analysis_status:
-                    "error",
-                }
-              : x
-          )
-        );
-      }
+  async function openAndAnalyzeEmail(email) {
+    if (!email?.id) return;
+    setSelectedId(email.id);
+    if (email.analysis_status === "done" || email.analysis_status === "loading") return;
+    setItems((prev) => prev.map((x) => x.id === email.id ? { ...x, analysis_status: "loading" } : x));
+    try {
+      const analyzed = await analyzeEmail({ email, provider, user_email: activeEmail, user_id: userId });
+      setItems((prev) => prev.map((x) => x.id === email.id ? { ...x, ...analyzed, analysis_status: "done" } : x));
+    } catch (e) {
+      console.error("Deep email analysis failed:", e);
+      setItems((prev) => prev.map((x) => x.id === email.id ? { ...x, analysis_status: "error" } : x));
     }
   }
 
@@ -808,7 +719,7 @@ export default function App() {
 
     try {
       setAnalytics(
-        await fetchAnalytics(14)
+        await fetchAnalytics(14, userId)
       );
     } catch (e) {
       setErr(
@@ -853,6 +764,7 @@ export default function App() {
     workspace?.id,
     workspace?.email,
     maxResults,
+    labelFilter,
   ]);
 
   const filtered = useMemo(() => {
@@ -879,8 +791,11 @@ export default function App() {
       );
     }
 
-    if (labelFilter !== "ALL") {
-      if (
+    if (labelFilter !== "ALL" && labelFilter !== "IMPORTANT") {
+      const semanticBuckets = new Set(["IMPORTANT_NOW","CONVERSATIONAL","BUSINESS","RECRUITING","SECURITY","FOLLOW_UP","TRANSACTIONAL","INFORMATIONAL","JOB_FEED","MARKETING","SOCIAL","AUTOMATED_LOW_VALUE","SPAM"]);
+      if (semanticBuckets.has(labelFilter)) {
+        res = res.filter((it) => String(it.bucket || "").toUpperCase() === labelFilter);
+      } else if (
         labelFilter ===
         "ATTACHMENTS"
       ) {
@@ -1187,21 +1102,20 @@ export default function App() {
                 )
               }
             >
-              <option value="ALL">
-                All Priority
-              </option>
-
-              <option value="HIGH">
-                High
-              </option>
-
-              <option value="MEDIUM">
-                Medium
-              </option>
-
-              <option value="LOW">
-                Low
-              </option>
+              <option value="IMPORTANT">Important</option>
+              <option value="CONVERSATIONAL">Conversations</option>
+              <option value="BUSINESS">Business</option>
+              <option value="RECRUITING">Recruiting</option>
+              <option value="SECURITY">Security</option>
+              <option value="FOLLOW_UP">Follow-ups</option>
+              <option value="TRANSACTIONAL">Transactions</option>
+              <option value="INFORMATIONAL">Informational</option>
+              <option value="JOB_FEED">Job Feeds</option>
+              <option value="MARKETING">Marketing</option>
+              <option value="SOCIAL">Social</option>
+              <option value="AUTOMATED_LOW_VALUE">Automated / Low Value</option>
+              <option value="SPAM">Spam</option>
+              <option value="ALL">All</option>
 
               <option value="ATTACHMENTS">
                 Has Attachments
@@ -1278,11 +1192,7 @@ export default function App() {
                       selectedId ===
                       it.id
                     }
-                    onSelect={() =>
-                      setSelectedId(
-                        it.id
-                      )
-                    }
+                    onSelect={() => openAndAnalyzeEmail(it)}
                     onPatchItem={(
                       patch
                     ) =>

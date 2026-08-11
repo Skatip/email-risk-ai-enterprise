@@ -3,6 +3,7 @@ import os
 import re
 import time
 from typing import Any, Dict, List, Optional
+from bs4 import BeautifulSoup
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -82,25 +83,59 @@ def _decode_body(data: str) -> str:
         return ""
 
 
+def _html_to_text(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        soup = BeautifulSoup(value, "html.parser")
+        for node in soup(["script", "style", "noscript"]):
+            node.decompose()
+        text = soup.get_text("\n")
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", value).strip()
+
+
 def _get_plain_text(payload: Dict[str, Any]) -> str:
-    parts: List[str] = []
+    """Extract the real message body, including HTML-only emails.
+
+    Many recruiting, university, banking, and notification emails are HTML-only.
+    Returning only text/plain caused the Communication Brain to see a Gmail snippet
+    and describe complete emails as 'partial'.
+    """
+    plain_parts: List[str] = []
+    html_parts: List[str] = []
 
     def walk(p: Dict[str, Any]):
         if not p:
             return
-
-        mime = p.get("mimeType", "")
+        mime = str(p.get("mimeType", "") or "").lower()
         body = p.get("body", {}) or {}
         data = body.get("data")
+        filename = str(p.get("filename") or "").strip().lower()
 
-        if mime == "text/plain" and data:
-            parts.append(_decode_body(data))
+        # Body MIME parts can have a filename in malformed/provider-generated mail.
+        # They are still message content, not user documents.
+        if data and mime == "text/plain":
+            decoded = _decode_body(data)
+            if decoded.strip():
+                plain_parts.append(decoded)
+        elif data and mime == "text/html":
+            decoded = _decode_body(data)
+            converted = _html_to_text(decoded)
+            if converted.strip():
+                html_parts.append(converted)
 
         for child in (p.get("parts", []) or []):
             walk(child)
 
     walk(payload or {})
-    return "\n".join(parts).strip()
+    chosen = plain_parts if any(x.strip() for x in plain_parts) else html_parts
+    text = "\n\n".join(x.strip() for x in chosen if x.strip())
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _extract_email(sender: str) -> str:
@@ -161,19 +196,29 @@ def _extract_attachments(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         size = int(body.get("size", 0) or 0)
 
         if filename and attachment_id:
-            file_type = classify_attachment(filename, mime_type)
-            risk = attachment_risk(filename, mime_type)
-
-            attachments.append({
-                "filename": filename,
-                "mime_type": mime_type,
-                "file_type": file_type,
-                "attachment_id": attachment_id,
-                "size": size,
-                "risk_level": risk.get("risk_level", "low"),
-                "risk_score": risk.get("risk_score", 0.05),
-                "risk_reasons": risk.get("risk_reasons", []),
-            })
+            low_name = filename.strip().lower()
+            low_mime = mime_type.strip().lower()
+            # Do not surface provider-generated copies of the email body as documents.
+            # This fixes items such as `this_message_in_html.html` being analyzed as a
+            # fake "General Document" attachment.
+            body_artifact = (
+                low_mime in {"text/html", "application/xhtml+xml"}
+                or low_name.endswith((".html", ".htm"))
+                or low_name in {"this_message_in_html.html", "message.html", "email.html"}
+            )
+            if not body_artifact:
+                file_type = classify_attachment(filename, mime_type)
+                risk = attachment_risk(filename, mime_type)
+                attachments.append({
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "file_type": file_type,
+                    "attachment_id": attachment_id,
+                    "size": size,
+                    "risk_level": risk.get("risk_level", "low"),
+                    "risk_score": risk.get("risk_score", 0.05),
+                    "risk_reasons": risk.get("risk_reasons", []),
+                })
 
         for child in (p.get("parts", []) or []):
             walk(child)
@@ -191,7 +236,11 @@ def _msg_to_email(msg: Dict[str, Any], include_body: bool = False) -> Dict[str, 
         "id": msg.get("id"),
         "threadId": msg.get("threadId"),
         "from": headers.get("from", ""),
+        "to": headers.get("to", ""),
         "subject": headers.get("subject", ""),
+        "message_id_header": headers.get("message-id", ""),
+        "in_reply_to": headers.get("in-reply-to", ""),
+        "references": headers.get("references", ""),
         "snippet": msg.get("snippet", "") or "",
         "body": _get_plain_text(payload) if include_body else "",
         "thread_context": "",

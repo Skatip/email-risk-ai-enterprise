@@ -14,6 +14,13 @@ If the context says a reply is not appropriate or essential user information is 
 Otherwise return exactly three concise, natural alternatives that answer the same sender request, with slightly different tone/length while preserving facts.
 Return JSON only: {"options": ["...", "...", "..."]}."""
 
+MULTI_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"options": {"type": "array", "items": {"type": "string"}, "maxItems": 3}},
+    "required": ["options"],
+}
+
 
 def generate_multi(
     email: Dict[str, Any],
@@ -34,6 +41,8 @@ def generate_multi(
         user=context,
         max_tokens=int(os.getenv("MULTI_REPLY_MAX_TOKENS", "700")),
         temperature=0.3,
+        schema=MULTI_SCHEMA,
+        schema_name="multi_reply_options",
     )
     options = []
     for value in result.get("options") or []:

@@ -49,17 +49,17 @@ def track_email_event(email: dict) -> None:
 
     cur.execute(
         """
-        INSERT INTO email_events (email_id, event_type, metadata, created_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO email_events (user_id, email_id, event_type, metadata, created_at)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (email.get("id"), "analyzed", json.dumps(metadata), int(time.time())),
+        (email.get("user_id") or "", email.get("id"), "analyzed", json.dumps(metadata), int(time.time())),
     )
 
     conn.commit()
     conn.close()
 
 
-def get_analytics_summary(days: int = 14) -> Dict[str, Any]:
+def get_analytics_summary(days: int = 14, user_id: str = "") -> Dict[str, Any]:
     now = int(time.time())
     since = now - max(1, int(days or 14)) * 86400
 
@@ -69,10 +69,10 @@ def get_analytics_summary(days: int = 14) -> Dict[str, Any]:
         """
         SELECT email_id, event_type, metadata, created_at
         FROM email_events
-        WHERE created_at >= ?
+        WHERE created_at >= ? AND user_id = ?
         ORDER BY created_at ASC
         """,
-        (since,),
+        (since, user_id or ""),
     ).fetchall()
     conn.close()
 

@@ -9,12 +9,13 @@ async function handle(res) {
 }
 
 
-export async function fetchInbox({ maxResults = 10, userEmail = "", provider = "gmail", query = "", userId = "" } = {}) {
+export async function fetchInbox({ maxResults = 12, userEmail = "", provider = "gmail", query = "", userId = "", bucket = "IMPORTANT" } = {}) {
   const url =
     `${API_BASE}/inbox?max_results=${encodeURIComponent(maxResults)}` +
     `&user_email=${encodeURIComponent(userEmail)}` +
     `&provider=${encodeURIComponent(provider)}` +
     `&query=${encodeURIComponent(query)}` +
+    `&bucket=${encodeURIComponent(bucket)}` +
     `&user_id=${encodeURIComponent(userId)}`;
   const res = await fetch(url);
   return await handle(res);
@@ -131,8 +132,8 @@ export async function updateFollowupStatus(id, status, userId = "") {
   return await handle(res);
 }
 
-export async function fetchAnalytics(days = 14) {
-  const res = await fetch(`${API_BASE}/analytics?days=${encodeURIComponent(days)}`);
+export async function fetchAnalytics(days = 14, userId = "") {
+  const res = await fetch(`${API_BASE}/analytics?days=${encodeURIComponent(days)}&user_id=${encodeURIComponent(userId)}`);
   return await handle(res);
 }
 

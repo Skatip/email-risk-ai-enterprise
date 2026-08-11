@@ -16,6 +16,22 @@ Never invent facts that are not present in the attachment analyses.
 Return JSON only with: summary, key_facts, conflicts, action_items, deadlines, reply_context, priority_reason, confidence.
 Keep reply_context compact and directly useful to the Communication Brain."""
 
+BUNDLE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "summary": {"type": "string"},
+        "key_facts": {"type": "array", "items": {"type": "string"}},
+        "conflicts": {"type": "array", "items": {"type": "string"}},
+        "action_items": {"type": "array", "items": {"type": "string"}},
+        "deadlines": {"type": "array", "items": {"type": "string"}},
+        "reply_context": {"type": "string"},
+        "priority_reason": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": ["summary", "key_facts", "conflicts", "action_items", "deadlines", "reply_context", "priority_reason", "confidence"],
+}
+
 
 def content_hash(data: bytes) -> str:
     return hashlib.sha256(data or b"").hexdigest()
@@ -120,8 +136,10 @@ def aggregate_attachment_intelligence(results: List[Dict[str, Any]]) -> Dict[str
         response = provider.generate_json(
             system=BUNDLE_PROMPT,
             user={"documents": compact_docs},
-            max_tokens=int(os.getenv("ATTACHMENT_BUNDLE_MAX_TOKENS", "800")),
+            max_tokens=int(os.getenv("ATTACHMENT_BUNDLE_MAX_TOKENS", "900")),
             temperature=0.0,
+            schema=BUNDLE_SCHEMA,
+            schema_name="attachment_bundle",
         )
     except Exception:
         response = {}

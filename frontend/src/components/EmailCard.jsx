@@ -1005,7 +1005,14 @@ export default function EmailCard({ item, onPatchItem, selected, onSelect, userI
           <div className="draftShell" onClick={(e) => e.stopPropagation()}>
             {draft.safety_blocked ? (
               <div className="muted">
-                <b>Draft blocked:</b> {draft.safety_reason}
+                <b>
+                  {String(draft?.decision || draft?.reply_meta?.decision || "").toUpperCase() === "NO_REPLY"
+                    ? "No reply recommended:"
+                    : String(draft?.decision || draft?.reply_meta?.decision || "").toUpperCase() === "ASK_USER"
+                      ? "Need your input:"
+                      : "Draft paused:"}
+                </b>{" "}
+                {draft.safety_reason}
               </div>
             ) : (
               <>
