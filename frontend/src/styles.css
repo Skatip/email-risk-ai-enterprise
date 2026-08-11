@@ -511,3 +511,18 @@ button:disabled { opacity: 0.65; cursor: not-allowed; }
   background: rgba(16, 163, 127, 0.08);
   color: var(--soft-text);
 }
+
+/* Enterprise inbox view: concise, task-oriented buckets instead of a long taxonomy list. */
+.inboxViewSelect {
+  min-width: 210px;
+  max-width: 240px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+@media (max-width: 700px) {
+  .inboxViewSelect {
+    min-width: 100%;
+    max-width: none;
+  }
+}

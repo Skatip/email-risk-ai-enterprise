@@ -84,6 +84,10 @@ def init_db() -> None:
         """CREATE TABLE IF NOT EXISTS audit_logs(
             id BIGSERIAL PRIMARY KEY, user_id TEXT, action TEXT, resource_type TEXT,
             resource_id TEXT, metadata JSONB DEFAULT '{}'::jsonb, created_at BIGINT)""",
+        """CREATE TABLE IF NOT EXISTS inbox_intelligence_cache(
+            user_id TEXT NOT NULL, email_id TEXT NOT NULL, semantic_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            updated_at BIGINT NOT NULL, PRIMARY KEY(user_id, email_id))""",
+        "CREATE INDEX IF NOT EXISTS idx_inbox_intelligence_user_updated ON inbox_intelligence_cache(user_id, updated_at DESC)",
     ]
     for statement in statements:
         cur.execute(statement)

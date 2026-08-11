@@ -80,29 +80,6 @@ function attachmentSearchText(it) {
   ].join(" ");
 }
 
-function hasAttachmentDocType(it, docType) {
-  const analyses = Array.isArray(it?.attachment_analysis)
-    ? it.attachment_analysis
-    : [];
-
-  const attachments = Array.isArray(it?.attachments)
-    ? it.attachments
-    : [];
-
-  const target = String(docType || "").toLowerCase();
-
-  return (
-    analyses.some(
-      (a) =>
-        String(a?.document_type || "").toLowerCase() === target
-    ) ||
-    attachments.some(
-      (a) =>
-        String(a?.file_type || "").toLowerCase() === target
-    )
-  );
-}
-
 function ThemeToggle({ theme, toggleTheme }) {
   return (
     <button
@@ -508,7 +485,7 @@ export default function App() {
   const [
     labelFilter,
     setLabelFilter,
-  ] = useState("IMPORTANT");
+  ] = useState("FOCUS");
 
   const [
     maxResults,
@@ -667,7 +644,7 @@ export default function App() {
             activeEmail,
           provider,
           userId,
-          bucket: ["ATTACHMENTS","INVOICE","CONTRACT","OFFER_LETTER","RESUME","TAX_DOCUMENT"].includes(labelFilter) ? "ALL" : labelFilter,
+          bucket: "ALL",
         });
 
       const next =
@@ -764,8 +741,33 @@ export default function App() {
     workspace?.id,
     workspace?.email,
     maxResults,
-    labelFilter,
   ]);
+
+  // While first-time semantic enrichment is running, refresh quietly from the
+  // persistent cache. This preserves the fast initial render and progressively
+  // fills priority/risk/reply intelligence without user clicks or duplicate LLM work.
+  useEffect(() => {
+    if (!workspace || loading || !items.some((x) => x.analysis_status === "pending")) return undefined;
+    const timer = window.setInterval(async () => {
+      try {
+        const data = await fetchInbox({
+          maxResults,
+          userEmail: activeEmail,
+          provider,
+          userId,
+          bucket: "ALL",
+        });
+        const next = Array.isArray(data) ? data : data?.items || [];
+        setItems((prev) => {
+          const locallyDone = new Map(prev.filter((x) => x.analysis_status === "done").map((x) => [x.id, x]));
+          return next.map((x) => locallyDone.has(x.id) ? { ...x, ...locallyDone.get(x.id) } : x);
+        });
+      } catch (e) {
+        console.debug("Background inbox enrichment poll skipped:", e);
+      }
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [workspace?.id, activeEmail, provider, userId, maxResults, loading, items]);
 
   const filtered = useMemo(() => {
     let res = [...items];
@@ -791,82 +793,56 @@ export default function App() {
       );
     }
 
-    if (labelFilter !== "ALL" && labelFilter !== "IMPORTANT") {
-      const semanticBuckets = new Set(["IMPORTANT_NOW","CONVERSATIONAL","BUSINESS","RECRUITING","SECURITY","FOLLOW_UP","TRANSACTIONAL","INFORMATIONAL","JOB_FEED","MARKETING","SOCIAL","AUTOMATED_LOW_VALUE","SPAM"]);
-      if (semanticBuckets.has(labelFilter)) {
-        res = res.filter((it) => String(it.bucket || "").toUpperCase() === labelFilter);
-      } else if (
-        labelFilter ===
-        "ATTACHMENTS"
-      ) {
-        res = res.filter(
-          (it) =>
-            Array.isArray(
-              it.attachments
-            ) &&
-            it.attachments
-              .length > 0
+    if (labelFilter !== "ALL") {
+      const bucket = (it) => String(it?.bucket || "").toUpperCase();
+
+      if (labelFilter === "FOCUS") {
+        const focusBuckets = new Set([
+          "IMPORTANT_NOW",
+          "CONVERSATIONAL",
+          "BUSINESS",
+          "RECRUITING",
+          "SECURITY",
+          "FOLLOW_UP",
+          "TRANSACTIONAL",
+        ]);
+        res = res.filter((it) =>
+          it?.analysis_status === "pending" ||
+          (focusBuckets.has(bucket(it)) &&
+            (Number(it?.inbox_score || 0) >= 0.38 ||
+              it?.requires_action === true ||
+              it?.direct_human === true ||
+              it?.security_event === true))
         );
-      } else if (
-        labelFilter ===
-        "INVOICE"
-      ) {
+      } else if (labelFilter === "NEEDS_REPLY") {
         res = res.filter(
           (it) =>
-            hasAttachmentDocType(
-              it,
-              "invoice"
-            )
+            it?.respond_recommended === true ||
+            String(it?.reply_decision || "").toUpperCase() === "DRAFT_REPLY"
         );
-      } else if (
-        labelFilter ===
-        "CONTRACT"
-      ) {
+      } else if (labelFilter === "PEOPLE") {
         res = res.filter(
           (it) =>
-            hasAttachmentDocType(
-              it,
-              "contract"
-            )
+            it?.direct_human === true ||
+            ["CONVERSATIONAL", "FOLLOW_UP"].includes(bucket(it))
         );
-      } else if (
-        labelFilter ===
-        "OFFER_LETTER"
-      ) {
-        res = res.filter(
-          (it) =>
-            hasAttachmentDocType(
-              it,
-              "offer_letter"
-            )
+      } else if (labelFilter === "WORK_CAREER") {
+        res = res.filter((it) =>
+          ["BUSINESS", "RECRUITING"].includes(bucket(it))
         );
-      } else if (
-        labelFilter ===
-        "RESUME"
-      ) {
-        res = res.filter(
-          (it) =>
-            hasAttachmentDocType(
-              it,
-              "resume"
-            )
+      } else if (labelFilter === "MONEY_SECURITY") {
+        res = res.filter((it) =>
+          ["TRANSACTIONAL", "SECURITY"].includes(bucket(it))
         );
-      } else if (
-        labelFilter ===
-        "TAX_DOCUMENT"
-      ) {
-        res = res.filter(
-          (it) =>
-            hasAttachmentDocType(
-              it,
-              "tax_document"
-            )
-        );
-      } else {
-        res = res.filter(
-          (it) =>
-            it.label ===
-            labelFilter
+      } else if (labelFilter === "UPDATES") {
+        res = res.filter((it) =>
+          [
+            "INFORMATIONAL",
+            "JOB_FEED",
+            "MARKETING",
+            "SOCIAL",
+            "AUTOMATED_LOW_VALUE",
+          ].includes(bucket(it))
         );
       }
     }
@@ -1094,7 +1070,9 @@ export default function App() {
             />
 
             <select
-              className="selectInput"
+              className="selectInput inboxViewSelect"
+              aria-label="Inbox view"
+              title="Choose a focused inbox view"
               value={labelFilter}
               onChange={(e) =>
                 setLabelFilter(
@@ -1102,44 +1080,13 @@ export default function App() {
                 )
               }
             >
-              <option value="IMPORTANT">Important</option>
-              <option value="CONVERSATIONAL">Conversations</option>
-              <option value="BUSINESS">Business</option>
-              <option value="RECRUITING">Recruiting</option>
-              <option value="SECURITY">Security</option>
-              <option value="FOLLOW_UP">Follow-ups</option>
-              <option value="TRANSACTIONAL">Transactions</option>
-              <option value="INFORMATIONAL">Informational</option>
-              <option value="JOB_FEED">Job Feeds</option>
-              <option value="MARKETING">Marketing</option>
-              <option value="SOCIAL">Social</option>
-              <option value="AUTOMATED_LOW_VALUE">Automated / Low Value</option>
-              <option value="SPAM">Spam</option>
-              <option value="ALL">All</option>
-
-              <option value="ATTACHMENTS">
-                Has Attachments
-              </option>
-
-              <option value="INVOICE">
-                Invoices
-              </option>
-
-              <option value="CONTRACT">
-                Contracts
-              </option>
-
-              <option value="OFFER_LETTER">
-                Offer Letters
-              </option>
-
-              <option value="RESUME">
-                Resumes
-              </option>
-
-              <option value="TAX_DOCUMENT">
-                Tax Documents
-              </option>
+              <option value="FOCUS">Focus — Important</option>
+              <option value="NEEDS_REPLY">Needs Reply</option>
+              <option value="PEOPLE">People & Conversations</option>
+              <option value="WORK_CAREER">Work & Career</option>
+              <option value="MONEY_SECURITY">Money & Security</option>
+              <option value="UPDATES">Updates & Low Priority</option>
+              <option value="ALL">All Mail</option>
             </select>
 
             <select
