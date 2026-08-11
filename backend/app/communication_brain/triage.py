@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List
 
@@ -56,6 +57,8 @@ Rules:
 - If no reply is needed, choose NO_REPLY and explain why. Do not turn NO_REPLY into ASK_USER just to be helpful.
 - ASK_USER only when a reply/action is appropriate but essential user-owned information is missing.
 - Never invent dates, amounts, availability, decisions, commitments, identities, or document facts.
+- Detect concrete future obligations/reminders (meetings, deadlines, promised reviews, payments, callbacks). If a reminder is useful, return follow_up with needed=true and a grounded remind_at_unix. Resolve relative words such as "today" using current_unix and the message timestamp; if the time cannot be grounded, use null rather than guessing.
+- commitments must contain only explicit or strongly supported user obligations from the message/thread.
 
 Use a semantic intent such as DIRECT_REQUEST, HUMAN_CONVERSATION, RECRUITING_UPDATE, APPLICATION_STATUS, MEETING_REQUEST, PAYMENT_OR_BILL, SECURITY_ALERT, TRAVEL_UPDATE, EDUCATION_ACTION, DOCUMENT_REVIEW, AUTOMATED_INFORMATION, NEWSLETTER, JOB_FEED, PROMOTION, SOCIAL_UPDATE, SPAM.
 Return only the required JSON fields."""
@@ -124,12 +127,24 @@ DEEP_SCHEMA: Dict[str, Any] = {
         "urgency": {"type": "string"},
         "known_facts": {"type": "array", "items": {"type": "string"}},
         "unknown_facts": {"type": "array", "items": {"type": "string"}},
+        "follow_up": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "needed": {"type": "boolean"},
+                "remind_at_unix": {"type": ["number", "null"]},
+                "note": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["needed", "remind_at_unix", "note", "reason"],
+        },
+        "commitments": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     },
     "required": [
         "priority", "label", "risk", "intent", "sender_type", "email_type", "relationship_type",
         "direct_human", "requires_action", "security_event", "security_reason", "respond_recommended",
-        "reply_decision", "reason", "priority_reason", "urgency", "known_facts", "unknown_facts", "confidence",
+        "reply_decision", "reason", "priority_reason", "urgency", "known_facts", "unknown_facts", "follow_up", "commitments", "confidence",
     ],
 }
 
@@ -334,6 +349,7 @@ def analyze_message_semantics(
             "recent_thread": recent_thread,
             "attachment_intelligence": docs,
             "prior_triage": existing or {},
+            "current_unix": int(time.time()),
         },
         max_tokens=int(os.getenv("EMAIL_ANALYSIS_MAX_TOKENS", "1100")),
         temperature=0.0,
@@ -346,6 +362,8 @@ def analyze_message_semantics(
             "urgency": str((response or {}).get("urgency") or "normal"),
             "known_facts": (response or {}).get("known_facts") or [],
             "unknown_facts": (response or {}).get("unknown_facts") or [],
+            "follow_up": (response or {}).get("follow_up") or {"needed": False, "remind_at_unix": None, "note": "", "reason": ""},
+            "commitments": (response or {}).get("commitments") or [],
         }
     )
     return normalized

@@ -370,6 +370,54 @@ async def email_analyze(payload: Dict[str, Any] = Body(...)):
             "attachment_reply_context": attachment_result.get("attachment_reply_context") or email.get("attachment_reply_context") or "",
         }
 
+        # Persist a grounded reminder discovered during deep analysis so the
+        # Follow-up dashboard reflects real commitments without requiring a second click.
+        follow = semantic.get("follow_up") or {}
+        remind_at = int(follow.get("remind_at_unix") or 0)
+        if user_id and follow.get("needed") and remind_at > 0:
+            try:
+                await asyncio.to_thread(
+                    create_followup,
+                    email.get("id", ""),
+                    remind_at,
+                    follow.get("note") or follow.get("reason") or "Follow up on this email",
+                    email.get("threadId", ""),
+                    email.get("subject", ""),
+                    email.get("from", ""),
+                    provider,
+                    user_id,
+                )
+                item["followup_persisted"] = True
+            except Exception as follow_err:
+                print(f"Automatic follow-up warning: {follow_err}")
+
+        item["ai_follow_up"] = follow
+        item["commitments"] = semantic.get("commitments") or []
+
+        # Persist a grounded reminder discovered during deep analysis so the
+        # Follow-up dashboard reflects real commitments without requiring a second click.
+        follow = semantic.get("follow_up") or {}
+        remind_at = int(follow.get("remind_at_unix") or 0)
+        if user_id and follow.get("needed") and remind_at > 0:
+            try:
+                await asyncio.to_thread(
+                    create_followup,
+                    email.get("id", ""),
+                    remind_at,
+                    follow.get("note") or follow.get("reason") or "Follow up on this email",
+                    email.get("threadId", ""),
+                    email.get("subject", ""),
+                    email.get("from", ""),
+                    provider,
+                    user_id,
+                )
+                item["followup_persisted"] = True
+            except Exception as follow_err:
+                print(f"Automatic follow-up warning: {follow_err}")
+
+        item["ai_follow_up"] = follow
+        item["commitments"] = semantic.get("commitments") or []
+
         try:
             track_email_event(item)
         except Exception as track_err:
@@ -477,26 +525,36 @@ async def reply_generate(payload: Dict[str, Any] = Body(...)):
             memories=memories,
             user_preferences=user_preferences,
         )
-        # Tool-gated scheduling: the brain may request a read-only calendar lookup.
-        # We never invent availability and never create an event automatically.
-        if result.get("decision") == "CHECK_CALENDAR" and user_id:
+        # Scheduling chronology:
+        # 1) read the calendar only, 2) ask the user, 3) draft only after explicit user input.
+        # A free calendar is not permission to accept a meeting on the user's behalf.
+        availability_confirmation = str(user_preferences.get("availability_confirmation") or "").strip().lower()
+        if result.get("decision") == "CHECK_CALENDAR" and user_id and not availability_confirmation:
             req = result.get("tool_request") or {}
             if req.get("time_min") and req.get("time_max"):
                 try:
                     availability = await asyncio.to_thread(free_busy, user_id, req["time_min"], req["time_max"])
-                    prefs_with_tool = {**user_preferences, "calendar_availability": availability}
-                    result = await asyncio.to_thread(
-                        process_communication, email, analysis, force=force, thread=thread,
-                        attachment_context=combined_attachment_context, memories=memories,
-                        user_preferences=prefs_with_tool,
-                    )
+                    busy = list(availability.get("busy") or [])
+                    result["decision"] = "ASK_USER"
+                    result["reply"] = ""
+                    result["should_reply"] = False
+                    result["respond_recommended"] = False
+                    result["needs_user_input"] = True
                     result["calendar_checked"] = True
                     result["calendar_availability"] = availability
+                    if busy:
+                        result["clarification_question"] = "Your calendar shows a conflict during the requested time. Are you still available for this meeting?"
+                    else:
+                        result["clarification_question"] = "Your calendar looks free during the requested time. Are you actually available for this meeting?"
                 except Exception as calendar_err:
                     result["decision"] = "ASK_USER"
                     result["reply"] = ""
-                    result["clarification_question"] = "I need your calendar availability to answer this scheduling request accurately. Please reconnect Google Calendar or tell me what times work for you."
+                    result["should_reply"] = False
+                    result["respond_recommended"] = False
+                    result["needs_user_input"] = True
+                    result["clarification_question"] = "I couldn't verify your calendar. Are you available for the requested meeting time?"
                     result["calendar_error"] = str(calendar_err)
+        result["attachments"] = email.get("attachments", [])
         result["attachment_analysis"] = attachment_context
         result["attachment_bundle"] = attachment_bundle
         return result

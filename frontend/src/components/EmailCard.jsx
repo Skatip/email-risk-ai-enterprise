@@ -248,7 +248,7 @@ function uniqueAttachmentResults(item, localResults) {
   return out;
 }
 
-export default function EmailCard({ item, onPatchItem, selected, onSelect, userId = "" }) {
+export default function EmailCard({ item, onPatchItem, onFollowupCreated, selected, onSelect, userId = "" }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(() => seedDraftFromItem(item));
   const [loadingDraft, setLoadingDraft] = useState(false);
@@ -269,6 +269,8 @@ export default function EmailCard({ item, onPatchItem, selected, onSelect, userI
   const [loadingAllAttachments, setLoadingAllAttachments] = useState(false);
   const [gmailDraftMsg, setGmailDraftMsg] = useState("");
   const [creatingGmailDraft, setCreatingGmailDraft] = useState(false);
+  const [calendarContext, setCalendarContext] = useState(null);
+  const [availabilitySubmitting, setAvailabilitySubmitting] = useState(false);
 
   useEffect(() => {
     const d = seedDraftFromItem(item);
@@ -286,6 +288,8 @@ export default function EmailCard({ item, onPatchItem, selected, onSelect, userI
     setLoadingAllAttachments(false);
     setGmailDraftMsg("");
     setCreatingGmailDraft(false);
+    setCalendarContext(null);
+    setAvailabilitySubmitting(false);
   }, [item?.id]);
 
   const subject = decodeHtml(item?.subject || "(no subject)");
@@ -477,6 +481,76 @@ export default function EmailCard({ item, onPatchItem, selected, onSelect, userI
     }
   }
 
+  async function persistSuggestedFollowup(out) {
+    const follow = out?.follow_up || {};
+    const remindAt = Number(follow?.remind_at_unix || 0);
+    if (!follow?.needed || remindAt <= 0 || !item?.id || !userId) return;
+    try {
+      await createFollowup({
+        email_id: item.id,
+        thread_id: item?.threadId || "",
+        remind_at: remindAt,
+        note: follow?.note || follow?.reason || "Follow up on this email",
+        subject: item?.subject || "",
+        sender: item?.from || "",
+        provider: item?.provider || "gmail",
+        user_id: userId,
+      });
+      setFollowMsg("Reminder added automatically");
+      onFollowupCreated?.();
+    } catch (e) {
+      console.warn("Automatic reminder creation skipped:", e);
+    }
+  }
+
+  async function submitAvailabilityConfirmation(answer) {
+    setAvailabilitySubmitting(true);
+    setErr("");
+    try {
+      const email = {
+        id: item?.id, from: item?.from, subject: item?.subject, snippet: item?.snippet,
+        body: item?.body || "", ts: item?.ts, provider: item?.provider || "gmail",
+        threadId: item?.threadId || "", attachments: item?.attachments || [],
+        attachment_analysis: item?.attachment_analysis || [],
+        attachment_reply_context: item?.attachment_reply_context || "",
+        attachment_bundle: item?.attachment_bundle || {},
+      };
+      const out = await generateReply({
+        email, analysis: { ...item }, force: false, user_id: userId,
+        user_preferences: {
+          availability_confirmation: answer,
+          calendar_availability: calendarContext?.calendar_availability || item?.calendar_availability || null,
+        },
+      });
+      const d = normalizeDraftPayload(out);
+      const finalDecision = String(out?.decision || d?.decision || "").toUpperCase();
+      const clarification = String(out?.clarification_question || d?.clarification_question || "");
+      onPatchItem?.({
+        reply_decision: finalDecision || item?.reply_decision,
+        respond_recommended: Boolean(out?.respond_recommended ?? ["DRAFT_REPLY", "DRAFT_AND_ACTION"].includes(finalDecision)),
+        clarification_question: clarification,
+        reason: out?.reason || out?.understanding || item?.reason,
+        ai_follow_up: out?.follow_up || item?.ai_follow_up || {},
+        commitments: out?.commitments || item?.commitments || [],
+        attachments: out?.attachments || item?.attachments || [],
+        attachment_analysis: out?.attachment_analysis || item?.attachment_analysis || [],
+        attachment_bundle: out?.attachment_bundle || item?.attachment_bundle || {},
+      });
+      await persistSuggestedFollowup(out);
+      if (["DRAFT_REPLY", "DRAFT_AND_ACTION"].includes(finalDecision)) {
+        setDraft(d);
+        setEditedText(d?.reply || "");
+        setCalendarContext(null);
+      } else {
+        setDraft({ ...d, reply: "", safety_blocked: true, safety_reason: clarification || out?.reason || "More information is required." });
+      }
+    } catch (e) {
+      setErr(String(e?.message || e));
+    } finally {
+      setAvailabilitySubmitting(false);
+    }
+  }
+
   async function onGenerateOrRegenerate() {
     setLoadingDraft(true);
     setErr("");
@@ -519,10 +593,21 @@ export default function EmailCard({ item, onPatchItem, selected, onSelect, userI
         ai_follow_up: out?.follow_up || item?.ai_follow_up || {},
         commitments: out?.commitments || item?.commitments || [],
         suggested_actions: out?.suggested_actions || item?.suggested_actions || [],
+        attachments: out?.attachments || item?.attachments || [],
         attachment_analysis: out?.attachment_analysis || item?.attachment_analysis || [],
         attachment_bundle: out?.attachment_bundle || item?.attachment_bundle || {},
         attachment_reply_context: out?.attachment_bundle?.reply_context || item?.attachment_reply_context || "",
+        calendar_checked: Boolean(out?.calendar_checked),
+        calendar_availability: out?.calendar_availability || item?.calendar_availability || null,
       });
+
+      await persistSuggestedFollowup(out);
+
+      if (finalDecision === "ASK_USER" && out?.calendar_checked) {
+        setCalendarContext(out);
+      } else if (finalDecision !== "ASK_USER") {
+        setCalendarContext(null);
+      }
 
       if (["NO_REPLY", "ASK_USER", "ACTION_ONLY", "WAIT"].includes(finalDecision)) {
         setDraft({
@@ -615,6 +700,7 @@ export default function EmailCard({ item, onPatchItem, selected, onSelect, userI
         user_id: userId,
       });
       setFollowMsg("Follow-up set");
+      onFollowupCreated?.();
     } catch (e) {
       setErr(String(e?.message || e));
       setFollowMsg("Failed to set reminder");
@@ -677,7 +763,7 @@ export default function EmailCard({ item, onPatchItem, selected, onSelect, userI
           <div className="attachmentRow" onClick={(e) => e.stopPropagation()}>
             {attachments.length > 1 && (
               <button className="softBtn" type="button" onClick={onAnalyzeAllAttachments} disabled={loadingAllAttachments}>
-                {loadingAllAttachments ? "Reading all documents..." : `Analyze all ${attachments.length} documents`}
+                {loadingAllAttachments ? "Summarizing all documents..." : `Summarize all ${attachments.length} documents`}
               </button>
             )}
             {attachments.map((att, idx) => {
@@ -700,7 +786,7 @@ export default function EmailCard({ item, onPatchItem, selected, onSelect, userI
                     disabled={loadingAttachment === key}
                     onClick={() => onAnalyzeAttachment(att)}
                   >
-                    {loadingAttachment === key ? "Analyzing..." : analyzed ? "✓ Analyzed" : "Analyze"}
+                    {loadingAttachment === key ? "Summarizing..." : analyzed ? "✓ Summarized" : "Summarize"}
                   </button>
 
                   {result && (
@@ -885,6 +971,20 @@ export default function EmailCard({ item, onPatchItem, selected, onSelect, userI
           </button>
         </div>
 
+        {calendarContext && String(calendarContext?.clarification_question || "").trim() && (
+          <div className="notice schedulingQuestion" onClick={(e) => e.stopPropagation()}>
+            <b>Calendar checked</b>
+            <div>{calendarContext.clarification_question}</div>
+            <div className="primaryActions">
+              <button className="softBtn primary" type="button" disabled={availabilitySubmitting} onClick={() => submitAvailabilityConfirmation("yes")}>
+                {availabilitySubmitting ? "Working..." : "Yes, I’m available"}
+              </button>
+              <button className="softBtn" type="button" disabled={availabilitySubmitting} onClick={() => submitAvailabilityConfirmation("no")}>
+                No, I’m not available
+              </button>
+            </div>
+          </div>
+        )}
         {!canReply && !replyNeedsFinalCheck && <div className="notice subtleNotice">{noReplyReason(item)}</div>}
         {savedMsg && <div className="notice">{savedMsg}</div>}
         {followMsg && <div className="notice">{followMsg}</div>}
@@ -1080,9 +1180,9 @@ export default function EmailCard({ item, onPatchItem, selected, onSelect, userI
 
                 {draft.reply_meta && (
                   <div className="draftFoot">
-                    regen: {draft.reply_meta.regenerated ? "yes" : "no"} • used_rag:{" "}
-                    {String(draft.reply_meta.used_rag)} • suppressed:{" "}
-                    {String(draft.reply_meta.suppressed || false)}
+                    {draft.reply_meta.regenerated !== undefined ? `regen: ${draft.reply_meta.regenerated ? "yes" : "no"}` : ""}
+                    {draft.reply_meta.used_rag !== undefined ? ` • used_rag: ${String(draft.reply_meta.used_rag)}` : ""}
+                    {draft.reply_meta.suppressed !== undefined ? ` • suppressed: ${String(draft.reply_meta.suppressed)}` : ""}
                     {draft.reply_meta.reply_intent ? ` • intent: ${draft.reply_meta.reply_intent}` : ""}
                     {draft.reply_meta.strategy ? ` • strategy: ${draft.reply_meta.strategy}` : ""}
                   </div>

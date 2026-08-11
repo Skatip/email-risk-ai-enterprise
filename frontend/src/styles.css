@@ -526,3 +526,12 @@ button:disabled { opacity: 0.65; cursor: not-allowed; }
     max-width: none;
   }
 }
+
+.schedulingQuestion {
+  display: grid;
+  gap: 10px;
+}
+
+.schedulingQuestion .primaryActions {
+  margin-top: 2px;
+}
