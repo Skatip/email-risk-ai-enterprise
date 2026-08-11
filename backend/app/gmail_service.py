@@ -301,64 +301,27 @@ def fetch_inbox_fast(
     scan_limit: int = 80,
     user_id: str = "",
 ) -> List[Dict[str, Any]]:
-    """Fetch inbox metadata with Gmail HTTP batching.
-
-    The previous implementation made one network round trip per message, which was
-    the dominant first-load cost on Render. Gmail supports batched metadata gets;
-    one bounded batch preserves the same message data while drastically reducing
-    request overhead. If batching is unavailable, fall back to the original path.
-    """
     svc = gmail_service(user_id)
     ids = _primary_and_spam_ids(query, max(scan_limit, max_results * 5), user_id)
-    # We may need to inspect extra IDs because category filtering happens after fetch,
-    # but keep the batch bounded for predictable latency and quota usage.
-    fetch_ids = ids[: max(max_results * 3, max_results)]
-    messages: Dict[str, Dict[str, Any]] = {}
 
-    def _callback(request_id, response, exception):
-        if exception is None and response:
-            messages[str(request_id)] = response
-
-    try:
-        batch = svc.new_batch_http_request(callback=_callback)
-        for message_id in fetch_ids:
-            req = svc.users().messages().get(
+    results: List[Dict[str, Any]] = []
+    for message_id in ids:
+        msg = (
+            svc.users()
+            .messages()
+            .get(
                 userId="me",
                 id=message_id,
                 format="metadata",
-                metadataHeaders=["From", "To", "Subject", "Date"],
+                metadataHeaders=["From", "Subject", "Date"],
             )
-            batch.add(req, request_id=str(message_id))
-        if fetch_ids:
-            batch.execute()
-    except Exception as batch_err:
-        print(f"Gmail metadata batch warning: {batch_err}; falling back to sequential fetch")
-        messages = {}
-        for message_id in fetch_ids:
-            try:
-                messages[str(message_id)] = (
-                    svc.users()
-                    .messages()
-                    .get(
-                        userId="me",
-                        id=message_id,
-                        format="metadata",
-                        metadataHeaders=["From", "To", "Subject", "Date"],
-                    )
-                    .execute()
-                )
-            except Exception as item_err:
-                print(f"Gmail metadata fetch warning for {message_id}: {item_err}")
-
-    results: List[Dict[str, Any]] = []
-    # Reconstruct in Gmail list order so batching never changes inbox ordering.
-    for message_id in fetch_ids:
-        msg = messages.get(str(message_id))
-        if not msg:
-            continue
+            .execute()
+        )
         email = _msg_to_email(msg, include_body=False)
+
         if not _is_primary_like(email.get("labelIds", [])):
             continue
+
         results.append(email)
         if len(results) >= max_results:
             break

@@ -4,7 +4,6 @@ from typing import Dict, Any, List
 import asyncio
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
 import os
 from dotenv import load_dotenv
 
@@ -26,7 +25,6 @@ from app.compose_from_notes_agent import write_from_notes
 from app.analytics_service import track_email_event, get_analytics_summary
 from app.attachment_analysis import analyze_attachment_bytes
 from app.attachment_bundle import content_hash, get_cached_attachment, save_cached_attachment, aggregate_attachment_intelligence
-from app.inbox_intelligence_cache import get_cached_semantics, save_semantics
 
 try:
     from app.followup_service import (
@@ -74,27 +72,7 @@ def _labels_text(item: Dict[str, Any]) -> str:
 
 _ANALYZE_CACHE: Dict[str, Any] = {}
 _ANALYZE_CACHE_LOCK = threading.Lock()
-_ANALYZE_CACHE_TTL = int(os.getenv("INBOX_CACHE_TTL_SECONDS", "30"))
-
-_RAW_INBOX_CACHE: Dict[str, Any] = {}
-_RAW_INBOX_CACHE_LOCK = threading.Lock()
-_RAW_INBOX_CACHE_TTL = int(os.getenv("RAW_INBOX_CACHE_TTL_SECONDS", "15"))
-
-def _raw_cache_get(key: str):
-    now = time.time()
-    with _RAW_INBOX_CACHE_LOCK:
-        item = _RAW_INBOX_CACHE.get(key)
-        if not item:
-            return None
-        exp, value = item
-        if exp < now:
-            _RAW_INBOX_CACHE.pop(key, None)
-            return None
-        return value
-
-def _raw_cache_set(key: str, value):
-    with _RAW_INBOX_CACHE_LOCK:
-        _RAW_INBOX_CACHE[key] = (time.time() + _RAW_INBOX_CACHE_TTL, value)
+_ANALYZE_CACHE_TTL = int(os.getenv("INBOX_CACHE_TTL_SECONDS", "90"))
 
 
 def _cache_get(key: str):
@@ -118,43 +96,6 @@ def _cache_set(key: str, value):
 def _clear_cache():
     with _ANALYZE_CACHE_LOCK:
         _ANALYZE_CACHE.clear()
-
-_INBOX_TRIAGE_INFLIGHT: set[str] = set()
-_INBOX_TRIAGE_LOCK = threading.Lock()
-# Uvicorn-only deployment: keep a small bounded executor inside the API process.
-# This preserves non-blocking inbox loading without Redis/Celery or unbounded thread creation.
-_INBOX_BACKGROUND_WORKERS = max(1, min(4, int(os.getenv("INBOX_BACKGROUND_WORKERS", "2"))))
-_INBOX_EXECUTOR = ThreadPoolExecutor(max_workers=_INBOX_BACKGROUND_WORKERS, thread_name_prefix="inbox-ai")
-
-def _triage_job_key(user_id: str, candidates: List[Dict[str, Any]]) -> str:
-    ids = ",".join(sorted(str(x.get("id") or "") for x in candidates if x.get("id")))
-    return f"{user_id}|{hash(ids)}"
-
-def _run_and_store_triage(user_id: str, candidates: List[Dict[str, Any]], job_key: str) -> None:
-    try:
-        result = triage_messages(candidates)
-        save_semantics(user_id, result)
-        _clear_cache()
-    except Exception as exc:
-        print(f"Background inbox triage warning: {exc}")
-    finally:
-        with _INBOX_TRIAGE_LOCK:
-            _INBOX_TRIAGE_INFLIGHT.discard(job_key)
-
-def _schedule_inbox_triage(user_id: str, candidates: List[Dict[str, Any]]) -> None:
-    if not candidates:
-        return
-    job_key = _triage_job_key(user_id, candidates)
-    with _INBOX_TRIAGE_LOCK:
-        if job_key in _INBOX_TRIAGE_INFLIGHT:
-            return
-        _INBOX_TRIAGE_INFLIGHT.add(job_key)
-    try:
-        _INBOX_EXECUTOR.submit(_run_and_store_triage, user_id or "", candidates, job_key)
-    except Exception:
-        with _INBOX_TRIAGE_LOCK:
-            _INBOX_TRIAGE_INFLIGHT.discard(job_key)
-        raise
 
 _ATTACHMENT_RESULT_CACHE: Dict[str, Any] = {}
 _ATTACHMENT_RESULT_CACHE_LOCK = threading.Lock()
@@ -237,7 +178,7 @@ async def inbox_fast(
     Fetches a bounded Primary + Spam candidate pool, then uses one compact semantic
     triage call to rank direct human and important messages before returning cards.
     """
-    cache_key = f"inbox|{user_id}|{provider}|{user_email}|{query}|ALL|{max_results}"
+    cache_key = f"inbox|{user_id}|{provider}|{user_email}|{query}|{bucket}|{max_results}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
@@ -249,17 +190,13 @@ async def inbox_fast(
                 detail="Outlook is intentionally disabled until Microsoft OAuth is configured; app-password login is not supported.",
             )
         else:
-            raw_key = f"raw|{user_id}|{user_email}|{_effective_query(query)}|{max_results}"
-            raw = _raw_cache_get(raw_key)
-            if raw is None:
-                raw = await asyncio.to_thread(
-                    fetch_inbox_fast,
-                    query=_effective_query(query),
-                    max_results=max(max_results * 3, 36),
-                    scan_limit=max(max_results * 6, 72),
-                    user_id=user_id,
-                )
-                _raw_cache_set(raw_key, raw)
+            raw = await asyncio.to_thread(
+                fetch_inbox_fast,
+                query=_effective_query(query),
+                max_results=max(max_results * 3, 36),
+                scan_limit=max(max_results * 6, 72),
+                user_id=user_id,
+            )
     except HTTPException:
         raise
     except Exception as e:
@@ -279,19 +216,13 @@ async def inbox_fast(
     # what deserves space in the intelligent inbox. One compact batched call keeps
     # token/cost usage bounded while preventing newsletters/job feeds from crowding
     # out direct human and important messages.
-    # Fast path: reuse persistent semantic intelligence immediately. New/stale messages
-    # are enriched in the background, so the request never waits on the LLM batch.
     triage_by_id: Dict[str, Dict[str, Any]] = {}
     if provider == "gmail" and candidates:
         try:
-            triage_by_id = get_cached_semantics(user_id or user_email or "default", [x.get("id") for x in candidates])
-        except Exception as cache_err:
-            print(f"Inbox intelligence cache warning: {cache_err}")
-            triage_by_id = {}
-
-        missing = [x for x in candidates if str(x.get("id")) not in triage_by_id]
-        if missing:
-            _schedule_inbox_triage(user_id or user_email or "default", missing)
+            triaged = await asyncio.to_thread(triage_messages, candidates)
+            triage_by_id = {str(x.get("id")): x for x in triaged if x.get("id")}
+        except Exception as triage_err:
+            print(f"Semantic inbox triage warning: {triage_err}")
 
     out: List[Dict[str, Any]] = []
     for e in candidates:
@@ -348,13 +279,27 @@ async def inbox_fast(
     else:
         out.sort(key=lambda x: int(x.get("ts", 0)), reverse=True)
 
-    # Return one enriched candidate set. User-facing views are local UI projections,
-    # so changing Focus / Needs Reply / Work / Security never re-fetches Gmail or re-runs AI.
+    requested_bucket = (bucket or "FOCUS").upper()
+    important_buckets = {"IMPORTANT_NOW", "CONVERSATIONAL", "BUSINESS", "RECRUITING", "SECURITY", "FOLLOW_UP", "TRANSACTIONAL"}
+    threshold = float(os.getenv("IMPORTANT_INBOX_MIN_SCORE", "0.38"))
+
+    if requested_bucket in {"FOCUS", "IMPORTANT"}:
+        out = [x for x in out if x.get("bucket") in important_buckets and (float(x.get("inbox_score", 0)) >= threshold or x.get("requires_action") or x.get("direct_human") or x.get("security_event"))]
+    elif requested_bucket == "NEEDS_REPLY":
+        out = [x for x in out if x.get("respond_recommended") or str(x.get("reply_decision") or "").upper() == "DRAFT_REPLY"]
+    elif requested_bucket == "PEOPLE":
+        out = [x for x in out if x.get("direct_human") or str(x.get("bucket") or "").upper() in {"CONVERSATIONAL", "FOLLOW_UP"}]
+    elif requested_bucket == "WORK_CAREER":
+        out = [x for x in out if str(x.get("bucket") or "").upper() in {"BUSINESS", "RECRUITING"}]
+    elif requested_bucket == "MONEY_SECURITY":
+        out = [x for x in out if str(x.get("bucket") or "").upper() in {"TRANSACTIONAL", "SECURITY"}]
+    elif requested_bucket == "UPDATES":
+        out = [x for x in out if str(x.get("bucket") or "").upper() in {"INFORMATIONAL", "JOB_FEED", "MARKETING", "SOCIAL", "AUTOMATED_LOW_VALUE"}]
+    elif requested_bucket != "ALL":
+        out = [x for x in out if str(x.get("bucket") or "").upper() == requested_bucket]
+
     out = out[:max_results]
-    # Never cache a partially enriched response in process memory; otherwise the
-    # local background worker can finish while the API keeps serving stale "pending" cards.
-    if out and all(x.get("analysis_status") != "pending" for x in out):
-        _cache_set(cache_key, out)
+    _cache_set(cache_key, out)
     return out
 
 

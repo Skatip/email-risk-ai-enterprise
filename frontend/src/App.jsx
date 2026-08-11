@@ -644,7 +644,7 @@ export default function App() {
             activeEmail,
           provider,
           userId,
-          bucket: "ALL",
+          bucket: labelFilter,
         });
 
       const next =
@@ -741,33 +741,8 @@ export default function App() {
     workspace?.id,
     workspace?.email,
     maxResults,
+    labelFilter,
   ]);
-
-  // While first-time semantic enrichment is running, refresh quietly from the
-  // persistent cache. This preserves the fast initial render and progressively
-  // fills priority/risk/reply intelligence without user clicks or duplicate LLM work.
-  useEffect(() => {
-    if (!workspace || loading || !items.some((x) => x.analysis_status === "pending")) return undefined;
-    const timer = window.setInterval(async () => {
-      try {
-        const data = await fetchInbox({
-          maxResults,
-          userEmail: activeEmail,
-          provider,
-          userId,
-          bucket: "ALL",
-        });
-        const next = Array.isArray(data) ? data : data?.items || [];
-        setItems((prev) => {
-          const locallyDone = new Map(prev.filter((x) => x.analysis_status === "done").map((x) => [x.id, x]));
-          return next.map((x) => locallyDone.has(x.id) ? { ...x, ...locallyDone.get(x.id) } : x);
-        });
-      } catch (e) {
-        console.debug("Background inbox enrichment poll skipped:", e);
-      }
-    }, 2500);
-    return () => window.clearInterval(timer);
-  }, [workspace?.id, activeEmail, provider, userId, maxResults, loading, items]);
 
   const filtered = useMemo(() => {
     let res = [...items];
@@ -807,12 +782,11 @@ export default function App() {
           "TRANSACTIONAL",
         ]);
         res = res.filter((it) =>
-          it?.analysis_status === "pending" ||
-          (focusBuckets.has(bucket(it)) &&
-            (Number(it?.inbox_score || 0) >= 0.38 ||
-              it?.requires_action === true ||
-              it?.direct_human === true ||
-              it?.security_event === true))
+          focusBuckets.has(bucket(it)) &&
+          (Number(it?.inbox_score || 0) >= 0.38 ||
+            it?.requires_action === true ||
+            it?.direct_human === true ||
+            it?.security_event === true)
         );
       } else if (labelFilter === "NEEDS_REPLY") {
         res = res.filter(
