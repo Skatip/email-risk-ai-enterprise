@@ -54,6 +54,20 @@ function fmtTime(ts) {
   return new Date(n).toLocaleString();
 }
 
+function reminderStateText(f) {
+  const status = String(f?.status || "pending").toLowerCase();
+  const eventAt = Number(f?.event_at || f?.remind_at || 0);
+  const now = Date.now() / 1000;
+  if (status === "missed") return "Missed / overdue";
+  if (status === "due") return "Due now";
+  if (status === "done") return "Done";
+  if (eventAt > now) {
+    const mins = Math.max(1, Math.round((eventAt - now) / 60));
+    if (mins <= 60) return `In ${mins} min`;
+  }
+  return status;
+}
+
 function attachmentSearchText(it) {
   const attachments = Array.isArray(it?.attachments)
     ? it.attachments
@@ -397,11 +411,11 @@ function FollowupPanel({
             <p>{f.note || "No note"}</p>
 
             <small>
-              {f.sender ||
-                f.provider ||
-                "email"}{" "}
-              • due {fmtTime(f.remind_at)} •{" "}
-              {f.status}
+              {f.sender || f.provider || "email"}{" "}
+              • {f.event_at ? "event" : "due"} {fmtTime(f.event_at || f.remind_at)}
+              {f.event_timezone ? ` • ${f.event_timezone}` : ""}
+              {f.remind_at && f.event_at && Number(f.remind_at) !== Number(f.event_at) ? ` • reminder ${fmtTime(f.remind_at)}` : ""}
+              {` • ${reminderStateText(f)}`}
             </small>
           </div>
 
@@ -744,6 +758,18 @@ export default function App() {
     labelFilter,
   ]);
 
+  // Lightweight in-app reminder clock. No Celery/Redis is required: while the
+  // app is open, refresh reminder state every 30 seconds so due/missed changes
+  // surface without waiting for a day change or manual refresh.
+  useEffect(() => {
+    if (!workspace) return undefined;
+    const timer = window.setInterval(() => {
+      loadFollowups();
+    }, 30000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace?.id, workspace?.email, userId]);
+
   const filtered = useMemo(() => {
     let res = [...items];
 
@@ -837,6 +863,22 @@ export default function App() {
         ) || null,
       [items, selectedId]
     );
+
+  const activeReminder = useMemo(() => {
+    const live = (followups || []).filter((f) => !["done", "dismissed"].includes(String(f?.status || "").toLowerCase()));
+    const missed = live.find((f) => String(f?.status || "").toLowerCase() === "missed");
+    if (missed) return { ...missed, ui_state: "missed" };
+    const due = live.find((f) => String(f?.status || "").toLowerCase() === "due");
+    if (due) return { ...due, ui_state: "due" };
+    const now = Date.now() / 1000;
+    const upcoming = live
+      .filter((f) => Number(f?.event_at || f?.remind_at || 0) > now)
+      .sort((a, b) => Number(a?.event_at || a?.remind_at || 0) - Number(b?.event_at || b?.remind_at || 0))[0];
+    if (upcoming && Number(upcoming?.event_at || upcoming?.remind_at || 0) - now <= 1800) {
+      return { ...upcoming, ui_state: "upcoming" };
+    }
+    return null;
+  }, [followups]);
 
   const counts = useMemo(() => {
     const high =
@@ -1022,6 +1064,28 @@ export default function App() {
           Analytics
         </button>
       </nav>
+
+      {activeReminder && (
+        <div className={`reminderBanner ${activeReminder.ui_state}`}>
+          <div>
+            <b>
+              {activeReminder.ui_state === "missed"
+                ? "Missed follow-up"
+                : activeReminder.ui_state === "due"
+                  ? "Reminder due now"
+                  : "Upcoming reminder"}
+            </b>
+            <span>{activeReminder.subject || "Email follow-up"}</span>
+            <small>
+              {activeReminder.note || ""}
+              {` • ${fmtTime(activeReminder.event_at || activeReminder.remind_at)}`}
+            </small>
+          </div>
+          <button className="softBtn" type="button" onClick={() => { setTab("followups"); loadFollowups(); }}>
+            View
+          </button>
+        </div>
+      )}
 
       {err && (
         <div className="errorBanner">

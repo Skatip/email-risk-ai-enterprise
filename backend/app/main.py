@@ -12,6 +12,7 @@ load_dotenv()
 from app.db import init_db, kv_get, kv_set
 from app.gmail_service import fetch_full_thread, fetch_inbox_fast, fetch_email_body, fetch_gmail_attachment, create_reply_draft
 from app.calendar_service import free_busy
+from app.time_grounding import extract_requested_time
 from app.reply_agent import save_rag_example, load_reply_memories
 from app.communication_brain.orchestrator import process_communication
 from app.communication_brain.triage import triage_messages, analyze_message_semantics
@@ -67,6 +68,65 @@ def _labels_text(item: Dict[str, Any]) -> str:
 
 # No keyword-based human/security/importance filter here. Gmail provides candidates;
 # semantic triage decides which messages deserve the intelligent inbox.
+
+
+def _is_scheduling_request(email: Dict[str, Any], analysis: Dict[str, Any]) -> bool:
+    semantic = " ".join(str((analysis or {}).get(k) or "") for k in ("intent", "message_type", "reply_decision", "sender_expectation")).upper()
+    return any(token in semantic for token in ("MEETING", "SCHEDUL", "APPOINTMENT", "CALENDAR"))
+
+
+def _ground_followup_time(email: Dict[str, Any], follow: Dict[str, Any], scheduling: bool = False) -> Dict[str, Any]:
+    """Prefer a deterministic time parsed from the email over an LLM-guessed timestamp."""
+    grounded = extract_requested_time(email) if scheduling else None
+    event_at = int((grounded or {}).get("event_at_unix") or 0)
+    llm_remind = int((follow or {}).get("remind_at_unix") or 0)
+    if event_at > 0:
+        lead = max(0, min(int(os.getenv("MEETING_REMINDER_LEAD_SECONDS", "900")), 24 * 3600))
+        remind_at = event_at - lead
+        # If the advance reminder is already in the past, keep the actual event as the
+        # temporal anchor so it becomes due/missed correctly rather than inventing now+1h.
+        if remind_at <= 0:
+            remind_at = event_at
+        return {
+            "remind_at": remind_at,
+            "event_at": event_at,
+            "event_timezone": grounded.get("timezone", ""),
+            "reminder_kind": "meeting",
+            "requested_time": grounded,
+        }
+    return {
+        "remind_at": llm_remind,
+        "event_at": llm_remind,
+        "event_timezone": "",
+        "reminder_kind": "email",
+        "requested_time": None,
+    }
+
+
+async def _persist_grounded_followup(email: Dict[str, Any], semantic: Dict[str, Any], provider: str, user_id: str) -> bool:
+    follow = semantic.get("follow_up") or {}
+    if not user_id or not follow.get("needed"):
+        return False
+    scheduling = _is_scheduling_request(email, semantic)
+    timing = _ground_followup_time(email, follow, scheduling=scheduling)
+    if int(timing.get("remind_at") or 0) <= 0:
+        return False
+    await asyncio.to_thread(
+        create_followup,
+        email.get("id", ""),
+        timing["remind_at"],
+        follow.get("note") or follow.get("reason") or "Follow up on this email",
+        email.get("threadId", ""),
+        email.get("subject", ""),
+        email.get("from", ""),
+        provider,
+        user_id,
+        timing["event_at"],
+        timing["event_timezone"],
+        timing["reminder_kind"],
+    )
+    semantic["grounded_timing"] = timing
+    return True
 
 
 
@@ -370,50 +430,15 @@ async def email_analyze(payload: Dict[str, Any] = Body(...)):
             "attachment_reply_context": attachment_result.get("attachment_reply_context") or email.get("attachment_reply_context") or "",
         }
 
-        # Persist a grounded reminder discovered during deep analysis so the
-        # Follow-up dashboard reflects real commitments without requiring a second click.
+        # Persist only a grounded reminder. For scheduling messages the concrete
+        # time in the email wins over any model-generated timestamp.
         follow = semantic.get("follow_up") or {}
-        remind_at = int(follow.get("remind_at_unix") or 0)
-        if user_id and follow.get("needed") and remind_at > 0:
-            try:
-                await asyncio.to_thread(
-                    create_followup,
-                    email.get("id", ""),
-                    remind_at,
-                    follow.get("note") or follow.get("reason") or "Follow up on this email",
-                    email.get("threadId", ""),
-                    email.get("subject", ""),
-                    email.get("from", ""),
-                    provider,
-                    user_id,
-                )
+        try:
+            if await _persist_grounded_followup(email, semantic, provider, user_id):
                 item["followup_persisted"] = True
-            except Exception as follow_err:
-                print(f"Automatic follow-up warning: {follow_err}")
-
-        item["ai_follow_up"] = follow
-        item["commitments"] = semantic.get("commitments") or []
-
-        # Persist a grounded reminder discovered during deep analysis so the
-        # Follow-up dashboard reflects real commitments without requiring a second click.
-        follow = semantic.get("follow_up") or {}
-        remind_at = int(follow.get("remind_at_unix") or 0)
-        if user_id and follow.get("needed") and remind_at > 0:
-            try:
-                await asyncio.to_thread(
-                    create_followup,
-                    email.get("id", ""),
-                    remind_at,
-                    follow.get("note") or follow.get("reason") or "Follow up on this email",
-                    email.get("threadId", ""),
-                    email.get("subject", ""),
-                    email.get("from", ""),
-                    provider,
-                    user_id,
-                )
-                item["followup_persisted"] = True
-            except Exception as follow_err:
-                print(f"Automatic follow-up warning: {follow_err}")
+                item["grounded_timing"] = semantic.get("grounded_timing")
+        except Exception as follow_err:
+            print(f"Automatic follow-up warning: {follow_err}")
 
         item["ai_follow_up"] = follow
         item["commitments"] = semantic.get("commitments") or []
@@ -525,10 +550,29 @@ async def reply_generate(payload: Dict[str, Any] = Body(...)):
             memories=memories,
             user_preferences=user_preferences,
         )
+
+        # Deterministic scheduling safety guard. Even if the model prematurely drafts
+        # an acceptance, a scheduling message cannot produce a reply until the user
+        # explicitly confirms availability. We ground the requested time from the
+        # actual email text and use Calendar only to report conflicts.
+        availability_confirmation = str(user_preferences.get("availability_confirmation") or "").strip().lower()
+        scheduling = _is_scheduling_request(email, {**analysis, **result})
+        grounded_request = extract_requested_time(email) if scheduling else None
+        if scheduling and not availability_confirmation and grounded_request:
+            result["decision"] = "CHECK_CALENDAR"
+            result["reply"] = ""
+            result["should_reply"] = False
+            result["respond_recommended"] = False
+            result["tool_request"] = {
+                "type": "calendar.check_availability",
+                "time_min": grounded_request["time_min"],
+                "time_max": grounded_request["time_max"],
+            }
+            result["requested_time"] = grounded_request
+
         # Scheduling chronology:
         # 1) read the calendar only, 2) ask the user, 3) draft only after explicit user input.
         # A free calendar is not permission to accept a meeting on the user's behalf.
-        availability_confirmation = str(user_preferences.get("availability_confirmation") or "").strip().lower()
         if result.get("decision") == "CHECK_CALENDAR" and user_id and not availability_confirmation:
             req = result.get("tool_request") or {}
             if req.get("time_min") and req.get("time_max"):
@@ -542,6 +586,7 @@ async def reply_generate(payload: Dict[str, Any] = Body(...)):
                     result["needs_user_input"] = True
                     result["calendar_checked"] = True
                     result["calendar_availability"] = availability
+                    result["requested_time"] = grounded_request or result.get("requested_time")
                     if busy:
                         result["clarification_question"] = "Your calendar shows a conflict during the requested time. Are you still available for this meeting?"
                     else:
@@ -554,6 +599,11 @@ async def reply_generate(payload: Dict[str, Any] = Body(...)):
                     result["needs_user_input"] = True
                     result["clarification_question"] = "I couldn't verify your calendar. Are you available for the requested meeting time?"
                     result["calendar_error"] = str(calendar_err)
+        try:
+            if await _persist_grounded_followup(email, result, provider, user_id):
+                result["followup_persisted"] = True
+        except Exception as follow_err:
+            print(f"Reply follow-up warning: {follow_err}")
         result["attachments"] = email.get("attachments", [])
         result["attachment_analysis"] = attachment_context
         result["attachment_bundle"] = attachment_bundle
@@ -676,6 +726,9 @@ def followup_create(payload: Dict[str, Any] = Body(...)):
         sender=payload.get("sender", ""),
         provider=payload.get("provider", "gmail"),
         user_id=payload.get("user_id", ""),
+        event_at=payload.get("event_at", 0),
+        event_timezone=payload.get("event_timezone", ""),
+        reminder_kind=payload.get("reminder_kind", "email"),
     )
 
 

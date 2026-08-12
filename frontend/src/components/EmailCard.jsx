@@ -72,8 +72,18 @@ function normalizeDraftPayload(payload) {
   };
 }
 
+function isSchedulingItem(item) {
+  const semantic = [item?.intent, item?.message_type, item?.sender_expectation, item?.reason]
+    .map((x) => String(x || "").toUpperCase())
+    .join(" ");
+  return ["MEETING", "SCHEDUL", "APPOINTMENT", "CALENDAR"].some((x) => semantic.includes(x));
+}
+
 function seedDraftFromItem(item) {
   if (!item) return null;
+  // Never surface a pre-generated meeting acceptance before the user has made
+  // the availability decision. Calendar-free is not user consent.
+  if (isSchedulingItem(item) && item?.availability_confirmed_by_user !== true) return null;
 
   const replyText =
     item?.suggested_reply ??
@@ -535,6 +545,8 @@ export default function EmailCard({ item, onPatchItem, onFollowupCreated, select
         attachments: out?.attachments || item?.attachments || [],
         attachment_analysis: out?.attachment_analysis || item?.attachment_analysis || [],
         attachment_bundle: out?.attachment_bundle || item?.attachment_bundle || {},
+        availability_confirmed_by_user: true,
+        availability_confirmation: answer,
       });
       await persistSuggestedFollowup(out);
       if (["DRAFT_REPLY", "DRAFT_AND_ACTION"].includes(finalDecision)) {
@@ -974,6 +986,9 @@ export default function EmailCard({ item, onPatchItem, onFollowupCreated, select
         {calendarContext && String(calendarContext?.clarification_question || "").trim() && (
           <div className="notice schedulingQuestion" onClick={(e) => e.stopPropagation()}>
             <b>Calendar checked</b>
+            {calendarContext?.requested_time?.event_at_unix && (
+              <div className="scheduleTime">Requested time: {new Date(Number(calendarContext.requested_time.event_at_unix) * 1000).toLocaleString()} {calendarContext?.requested_time?.timezone_label || ""}</div>
+            )}
             <div>{calendarContext.clarification_question}</div>
             <div className="primaryActions">
               <button className="softBtn primary" type="button" disabled={availabilitySubmitting} onClick={() => submitAvailabilityConfirmation("yes")}>

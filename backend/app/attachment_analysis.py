@@ -403,13 +403,13 @@ def _find_dates(text: str) -> List[str]:
 def _find_actions(text: str) -> List[str]:
     low = (text or "").lower()
     actions: List[str] = []
-    for verb in ACTION_RE.findall(low):
-        actions.append(f"Possible action: {verb}")
-    if "invoice" in low or "payment" in low or "amount due" in low:
+    # Do not turn every verb in a document into a fake user task. Only emit
+    # actions when the document itself contains strong operational evidence.
+    if "invoice" in low or "amount due" in low or "payment due" in low or "total due" in low:
         actions.append("Review payment or invoice details.")
-    if "sign" in low or "signature" in low or "accept this offer" in low:
+    if "signature required" in low or "please sign" in low or "accept this offer" in low:
         actions.append("Check if signature or acceptance is required.")
-    if "deadline" in low or "due date" in low or "start date" in low:
+    if "deadline" in low or "due date" in low:
         actions.append("Check important date or deadline.")
     if "resume" in low or "curriculum vitae" in low:
         actions.append("Review candidate profile or resume details.")
@@ -619,8 +619,18 @@ def analyze_attachment_bytes(
 
     llm_actions = llm.get("action_items") or []
     merged_actions = list(dict.fromkeys([str(x) for x in (llm_actions + actions) if str(x).strip()]))[:8]
-    merged_dates = list(dict.fromkeys([str(x) for x in ((llm.get("dates") or []) + dates) if str(x).strip()]))[:10]
-    merged_amounts = list(dict.fromkeys([str(x) for x in ((llm.get("amounts") or []) + amounts) if str(x).strip()]))[:10]
+    # Parser-extracted attachment text is the source of truth for dates/amounts.
+    # Keep an LLM value only when it is visibly grounded in the attachment text;
+    # this prevents email-context words such as "today/tomorrow" leaking into
+    # the document summary.
+    extracted_low = (extracted or "").lower()
+    grounded_llm_dates = [str(x) for x in (llm.get("dates") or []) if str(x).strip() and str(x).strip().lower() in extracted_low]
+    grounded_llm_amounts = [str(x) for x in (llm.get("amounts") or []) if str(x).strip() and str(x).strip().lower() in extracted_low]
+    merged_dates = list(dict.fromkeys(grounded_llm_dates + [str(x) for x in dates if str(x).strip()]))[:10]
+    merged_amounts = list(dict.fromkeys(grounded_llm_amounts + [str(x) for x in amounts if str(x).strip()]))[:10]
+    strong_payment_evidence = any(x in extracted_low for x in ("invoice", "amount due", "payment due", "total due"))
+    if not strong_payment_evidence:
+        merged_actions = [x for x in merged_actions if "payment or invoice" not in x.lower()]
 
     risk = attachment_risk(filename, mime_type, sender_band, source_folder, document_type)
     boost = attachment_priority_boost(document_type, risk.get("risk_level", "low"), merged_actions, max(float(doc.get("confidence", 0.35) or 0.35), float(llm.get("confidence", 0.0) or 0.0)))

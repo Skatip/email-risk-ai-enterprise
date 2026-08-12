@@ -67,7 +67,8 @@ def init_db() -> None:
         """CREATE TABLE IF NOT EXISTS followup_reminders(
             id BIGSERIAL PRIMARY KEY, user_id TEXT DEFAULT '', email_id TEXT, thread_id TEXT,
             remind_at BIGINT, status TEXT DEFAULT 'pending', note TEXT, created_at BIGINT,
-            subject TEXT, sender TEXT, provider TEXT DEFAULT 'gmail', triggered_at BIGINT, completed_at BIGINT)""",
+            subject TEXT, sender TEXT, provider TEXT DEFAULT 'gmail', triggered_at BIGINT, completed_at BIGINT,
+            event_at BIGINT, event_timezone TEXT DEFAULT '', reminder_kind TEXT DEFAULT 'email')""",
         """CREATE TABLE IF NOT EXISTS email_events(
             id BIGSERIAL PRIMARY KEY, user_id TEXT DEFAULT '', email_id TEXT, event_type TEXT,
             metadata TEXT, created_at BIGINT)""",
@@ -87,6 +88,10 @@ def init_db() -> None:
     ]
     for statement in statements:
         cur.execute(statement)
+    # Safe additive migrations for existing Neon databases.
+    cur.execute("ALTER TABLE followup_reminders ADD COLUMN IF NOT EXISTS event_at BIGINT")
+    cur.execute("ALTER TABLE followup_reminders ADD COLUMN IF NOT EXISTS event_timezone TEXT DEFAULT ''")
+    cur.execute("ALTER TABLE followup_reminders ADD COLUMN IF NOT EXISTS reminder_kind TEXT DEFAULT 'email'")
     conn.commit()
     conn.close()
 
