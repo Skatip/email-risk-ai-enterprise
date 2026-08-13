@@ -688,6 +688,7 @@ def feedback(payload: Dict[str, Any] = Body(...)):
         subject=payload.get("subject") or "",
         snippet=payload.get("snippet") or "",
         meta=payload.get("meta") or {},
+        user_id=payload.get("user_id", ""),
     )
     _clear_cache()
     return result

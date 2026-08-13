@@ -8,6 +8,7 @@ import {
   updateFollowupStatus,
   googleConnectUrl,
   fetchGoogleStatus,
+  disconnectGoogle,
 } from "./api";
 
 import EmailCard from "./components/EmailCard";
@@ -437,30 +438,24 @@ function FollowupPanel({
 
 export default function App() {
   /*
-   * Temporary user identity for local/private testing.
+   * Account-bound testing identity.
    *
-   * For public enterprise release this should later be
-   * replaced by backend-authenticated user/session identity.
+   * A fresh opaque id is created for every new Google OAuth connection.
+   * The callback returns that id and it becomes the active workspace id.
+   * This prevents a second Gmail account in the same browser from silently
+   * restoring the first account's inbox, calendar, follow-ups, or analytics.
    */
-  const [userId] = useState(() => {
-    const existing =
-      localStorage.getItem(
-        "email_ai_user_id"
-      );
+  const [userId, setUserId] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    const callbackUserId = params.get("user_id");
+    const gmailConnected = params.get("gmail") === "connected";
 
-    if (existing) {
-      return existing;
+    if (gmailConnected && callbackUserId) {
+      localStorage.setItem("email_ai_user_id", callbackUserId);
+      return callbackUserId;
     }
 
-    const created =
-      crypto.randomUUID();
-
-    localStorage.setItem(
-      "email_ai_user_id",
-      created
-    );
-
-    return created;
+    return localStorage.getItem("email_ai_user_id") || "";
   });
 
   const [theme, setTheme] = useState(
@@ -530,6 +525,34 @@ export default function App() {
   const activeEmail =
     workspace?.email || "";
 
+  function beginGoogleConnection() {
+    const freshUserId = crypto.randomUUID();
+    localStorage.setItem("email_ai_pending_user_id", freshUserId);
+    window.location.href = googleConnectUrl(freshUserId);
+  }
+
+  async function switchGoogleAccount() {
+    setErr("");
+    try {
+      if (userId) {
+        await disconnectGoogle(userId);
+      }
+    } catch (e) {
+      // Switching should still be possible if the old token has already expired.
+      console.log("Previous Google connection could not be disconnected:", e);
+    }
+
+    localStorage.removeItem("email_ai_user_id");
+    localStorage.removeItem("email_ai_pending_user_id");
+    setItems([]);
+    setSelectedId(null);
+    setAnalytics(null);
+    setFollowups([]);
+    setWorkspace(null);
+    setUserId("");
+    beginGoogleConnection();
+  }
+
   /*
    * Theme
    */
@@ -563,6 +586,11 @@ export default function App() {
     let cancelled = false;
 
     async function restoreGoogleSession() {
+      if (!userId) {
+        if (!cancelled) setCheckingGoogle(false);
+        return;
+      }
+
       try {
         const status =
           await fetchGoogleStatus(
@@ -602,7 +630,8 @@ export default function App() {
 
           if (
             params.has("gmail") ||
-            params.has("email")
+            params.has("email") ||
+            params.has("user_id")
           ) {
             window.history.replaceState(
               {},
@@ -934,12 +963,7 @@ export default function App() {
     return (
       <LandingPage
         onChoose={setWorkspace}
-        onConnectGmail={() => {
-          window.location.href =
-            googleConnectUrl(
-              userId
-            );
-        }}
+        onConnectGmail={beginGoogleConnection}
         theme={theme}
         toggleTheme={
           toggleTheme
@@ -984,6 +1008,14 @@ export default function App() {
         </div>
 
         <div className="headerRight">
+          <button
+            className="softBtn"
+            onClick={switchGoogleAccount}
+            title="Disconnect this Gmail workspace and connect a different Google account"
+          >
+            Switch account
+          </button>
+
           <ThemeToggle
             theme={theme}
             toggleTheme={

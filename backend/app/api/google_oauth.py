@@ -83,7 +83,9 @@ def connect(user_id: str = Query(..., min_length=1)):
 
     authorization_url, _ = flow.authorization_url(
         access_type="offline",
-        prompt="consent",
+        # Always surface the account chooser during team testing so switching
+        # Gmail accounts cannot silently reuse the browser's previous account.
+        prompt="consent select_account",
         state=oauth_state,
     )
 
@@ -227,6 +229,9 @@ def callback(
         {
             "gmail": "connected",
             "email": account_email,
+            # Return the opaque workspace id that initiated this OAuth flow.
+            # The frontend makes it the active account context after callback.
+            "user_id": user_id,
         }
     )
 

@@ -85,6 +85,10 @@ def init_db() -> None:
         """CREATE TABLE IF NOT EXISTS audit_logs(
             id BIGSERIAL PRIMARY KEY, user_id TEXT, action TEXT, resource_type TEXT,
             resource_id TEXT, metadata JSONB DEFAULT '{}'::jsonb, created_at BIGINT)""",
+        """CREATE TABLE IF NOT EXISTS user_email_feedback(
+            id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL, email_id TEXT, sender_email TEXT,
+            sender_domain TEXT, clicked TEXT NOT NULL, subject TEXT, snippet TEXT, meta JSONB DEFAULT '{}'::jsonb,
+            created_at BIGINT NOT NULL)""",
     ]
     for statement in statements:
         cur.execute(statement)

@@ -41,6 +41,52 @@ def _get_domain(sender_email: str) -> str:
         return ""
     return s.split("@", 1)[1].strip()
 
+def _record_feedback_db(*, user_id: str, email_id: str, sender_email: str, sender_domain: str, clicked: str, subject: str, snippet: str, meta: Dict[str, Any], ts: int) -> Dict[str, Any]:
+    from app.db import connect
+    conn = connect(); cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO user_email_feedback(
+            user_id,email_id,sender_email,sender_domain,clicked,subject,snippet,meta,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?)""",
+        (user_id, email_id, sender_email, sender_domain, clicked, subject or "", (snippet or "")[:300], json.dumps(meta or {}), ts),
+    )
+    conn.commit(); conn.close()
+    return {
+        "ok": True,
+        "stored": {
+            "ts": ts, "email_id": email_id, "sender_email": sender_email,
+            "sender_domain": sender_domain, "clicked": clicked, "subject": subject or "",
+            "snippet": (snippet or "")[:300], "meta": meta or {},
+        },
+        "storage": "postgresql_user_scoped",
+    }
+
+def _feedback_counts_db(user_id: str, sender_email: str, sender_domain: str) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    from app.db import connect
+    conn = connect(); cur = conn.cursor()
+    sender_rows = cur.execute(
+        "SELECT clicked, COUNT(*) AS n, MAX(created_at) AS last_ts FROM user_email_feedback WHERE user_id=? AND sender_email=? GROUP BY clicked",
+        (user_id, sender_email),
+    ).fetchall()
+    domain_rows = cur.execute(
+        "SELECT clicked, COUNT(*) AS n, MAX(created_at) AS last_ts FROM user_email_feedback WHERE user_id=? AND sender_domain=? GROUP BY clicked",
+        (user_id, sender_domain),
+    ).fetchall() if sender_domain else []
+    conn.close()
+
+    def make(rows):
+        if not rows:
+            return None
+        counts = {k: 0 for k in LABELS}; total = 0; last_ts = 0
+        for r in rows:
+            key = str(r["clicked"] or "").upper()
+            if key in counts:
+                n = int(r["n"] or 0); counts[key] += n; total += n
+                last_ts = max(last_ts, int(r["last_ts"] or 0))
+        return {"counts": counts, "total": total, "last_ts": last_ts}
+
+    return make(sender_rows), make(domain_rows)
+
 def _init_bucket(store: Dict[str, Any], bucket: str, key: str) -> Dict[str, Any]:
     store.setdefault(bucket, {})
     if key not in store[bucket]:
@@ -64,6 +110,7 @@ def record_feedback(
     meta: Optional[Dict[str, Any]] = None,
     ts: Optional[int] = None,
     path: str = DEFAULT_STORE_PATH,
+    user_id: str = "",
 ) -> Dict[str, Any]:
     clicked = (clicked or "").upper().strip()
     if clicked not in LABELS:
@@ -72,17 +119,27 @@ def record_feedback(
     sender_email = (sender_email or "").lower().strip()
     sender_domain = _get_domain(sender_email)
 
-    store = _load_store(path)
     t = int(ts or _now())
 
+    if user_id:
+        return _record_feedback_db(
+            user_id=user_id, email_id=email_id, sender_email=sender_email, sender_domain=sender_domain,
+            clicked=clicked, subject=subject, snippet=snippet, meta=meta or {}, ts=t,
+        )
+
+    # Legacy single-user fallback only. Team/public flows always provide user_id
+    # and therefore use PostgreSQL above.
+    store = _load_store(path)
+    scoped = store
+
     if sender_email:
-        row = _init_bucket(store, "senders", sender_email)
+        row = _init_bucket(scoped, "senders", sender_email)
         row["counts"][clicked] += 1
         row["total"] += 1
         row["last_ts"] = t
 
     if sender_domain:
-        row = _init_bucket(store, "domains", sender_domain)
+        row = _init_bucket(scoped, "domains", sender_domain)
         row["counts"][clicked] += 1
         row["total"] += 1
         row["last_ts"] = t
@@ -97,10 +154,10 @@ def record_feedback(
         "snippet": (snippet or "")[:300],
         "meta": meta or {},
     }
-    store.setdefault("events", [])
-    store["events"].append(ev)
-    if len(store["events"]) > 2000:
-        store["events"] = store["events"][-2000:]
+    scoped.setdefault("events", [])
+    scoped["events"].append(ev)
+    if len(scoped["events"]) > 2000:
+        scoped["events"] = scoped["events"][-2000:]
 
     _save_store(store, path)
     return {"ok": True, "stored": ev}
@@ -112,16 +169,18 @@ def _posterior_best(counts: Dict[str, int], alpha: float = 1.0) -> Tuple[str, fl
     best = max(probs.items(), key=lambda kv: kv[1])
     return best[0], float(best[1])
 
-def predict_user_preference(sender_email: str, *, path: str = DEFAULT_STORE_PATH) -> Optional[Dict[str, Any]]:
+def predict_user_preference(sender_email: str, *, path: str = DEFAULT_STORE_PATH, user_id: str = "") -> Optional[Dict[str, Any]]:
     sender_email = (sender_email or "").lower().strip()
     if not sender_email:
         return None
 
     domain = _get_domain(sender_email)
-    store = _load_store(path)
-
-    sender_row = store.get("senders", {}).get(sender_email)
-    domain_row = store.get("domains", {}).get(domain) if domain else None
+    if user_id:
+        sender_row, domain_row = _feedback_counts_db(user_id, sender_email, domain)
+    else:
+        store = _load_store(path)
+        sender_row = store.get("senders", {}).get(sender_email)
+        domain_row = store.get("domains", {}).get(domain) if domain else None
 
     # anti-misclick guards
     min_evidence_sender = 3

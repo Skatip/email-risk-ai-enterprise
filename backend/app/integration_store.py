@@ -59,6 +59,13 @@ def save_connection(user_id: str, provider: str, account_email: str, credentials
     now = int(time.time())
     with psycopg.connect(_database_url()) as connection:
         with connection.cursor() as cur:
+            # One opaque workspace id represents exactly one active Google
+            # account. This removes ambiguous "latest connection wins" behavior
+            # if an id was ever reused by an older frontend.
+            cur.execute(
+                "UPDATE integration_connections SET status='disconnected', updated_at=%s WHERE user_id=%s AND provider=%s AND account_email<>%s AND status='connected'",
+                (now, user_id, provider, account_email),
+            )
             cur.execute("""INSERT INTO integration_connections(
                 user_id, provider, account_email, encrypted_credentials, scopes, status, created_at, updated_at
             ) VALUES(%s,%s,%s,%s,%s::jsonb,'connected',%s,%s)

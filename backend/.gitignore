@@ -23,3 +23,5 @@ credentials.json
 # IDE
 .vscode/
 .idea/
+# Runtime personalization data (team/user specific)
+app/app_data/learning_store.json

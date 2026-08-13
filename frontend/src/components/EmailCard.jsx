@@ -452,6 +452,7 @@ export default function EmailCard({ item, onPatchItem, onFollowupCreated, select
         subject: item?.subject || "",
         snippet: item?.snippet || "",
         provider: item?.provider || "gmail",
+        user_id: userId,
         meta: { ui: "emailcard" },
       });
     } catch (e) {

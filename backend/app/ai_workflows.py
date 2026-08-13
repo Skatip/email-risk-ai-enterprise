@@ -11,19 +11,20 @@ def analyze_email_workflow(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     email = payload.get("email") or {}
     provider = payload.get("provider") or email.get("provider") or "gmail"
+    user_id = payload.get("user_id") or email.get("user_id") or ""
     if not email:
         raise ValueError("email required")
 
     if provider == "gmail" and email.get("id") and not (email.get("body") or "").strip():
         try:
-            full = fetch_email_body(email.get("id"))
+            full = fetch_email_body(email.get("id"), user_id)
             email = {**email, **full}
         except Exception as body_err:
             print(f"Analyze body fetch warning: {body_err}")
 
     po = priority_score(email)
     name, sender_email = parse_sender(email.get("from", ""))
-    pref = predict_user_preference(sender_email)
+    pref = predict_user_preference(sender_email, user_id=user_id)
     new_p, new_label, new_rr = apply_user_override(
         po.priority,
         po.label,
@@ -54,6 +55,7 @@ def analyze_email_workflow(payload: Dict[str, Any]) -> Dict[str, Any]:
         "risk_reasons": (getattr(po, "human_signals", None) or {}).get("risk_reasons", []),
         "risk_urls": (getattr(po, "human_signals", None) or {}).get("risk_urls", []),
         "provider": provider,
+        "user_id": user_id,
         "analysis_status": "done",
         "source_folder": email.get("source_folder", ""),
         "email_type": email.get("email_type", ""),
@@ -78,13 +80,14 @@ def reply_generate_workflow(payload: Dict[str, Any]) -> Dict[str, Any]:
     email = payload.get("email") or {}
     analysis = payload.get("analysis") or {}
     force = bool(payload.get("force", False))
+    user_id = payload.get("user_id") or email.get("user_id") or ""
     if not email:
         raise ValueError("email payload is required")
 
     if (email.get("provider") or analysis.get("provider") or "gmail") == "gmail":
         if not (email.get("body") or "").strip() and email.get("id"):
             try:
-                full = fetch_email_body(email.get("id"))
+                full = fetch_email_body(email.get("id"), user_id)
                 email = {**email, **full}
             except Exception as body_err:
                 print(f"Reply body fetch warning: {body_err}")
