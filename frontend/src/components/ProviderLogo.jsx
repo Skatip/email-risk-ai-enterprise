@@ -21,6 +21,16 @@ export default function ProviderLogo({ type = "gmail", size = 28, className = ""
     );
   }
 
+
+  if (type === "yahoo") {
+    return (
+      <svg {...common}>
+        <rect width="48" height="48" rx="12" fill="#6001D2" />
+        <text x="24" y="31" textAnchor="middle" fontSize="22" fontWeight="700" fill="#fff">Y!</text>
+      </svg>
+    );
+  }
+
   if (type === "outlook") {
     return (
       <svg {...common}>

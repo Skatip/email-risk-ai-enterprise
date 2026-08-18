@@ -17,6 +17,7 @@ from app.reply_agent import save_rag_example, load_reply_memories
 from app.communication_brain.orchestrator import process_communication
 from app.communication_brain.triage import triage_messages, analyze_message_semantics
 from app.api.google_oauth import router as google_oauth_router
+from app.api.yahoo_oauth import router as yahoo_oauth_router
 from app.api.mcp_tools import router as mcp_tools_router
 from app.integration_store import init_integration_store
 from app.reply_multi import generate_multi
@@ -45,6 +46,7 @@ except Exception:
 
 app = FastAPI(title="Enterprise Communication Intelligence API", version="2.0.0")
 app.include_router(google_oauth_router)
+app.include_router(yahoo_oauth_router)
 app.include_router(mcp_tools_router)
 
 app.add_middleware(
@@ -248,6 +250,15 @@ async def inbox_fast(
             raise HTTPException(
                 status_code=501,
                 detail="Outlook is intentionally disabled until Microsoft OAuth is configured; app-password login is not supported.",
+            )
+        elif provider == "yahoo":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Yahoo OAuth is connected, but Yahoo Mail API access uses the restricted mail-r permission. "
+                    "Yahoo must enable Mail API access for this developer application before mailbox reads can be wired. "
+                    "This build intentionally does not use IMAP or app passwords."
+                ),
             )
         else:
             raw = await asyncio.to_thread(

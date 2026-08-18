@@ -187,3 +187,18 @@ export async function disconnectGoogle(userId) {
   const res = await fetch(`${API_BASE}/integrations/google?user_id=${encodeURIComponent(userId)}`, { method: "DELETE" });
   return await handle(res);
 }
+
+
+export function yahooConnectUrl(userId) {
+  return `${API_BASE}/integrations/yahoo/connect?user_id=${encodeURIComponent(userId)}`;
+}
+
+export async function fetchYahooStatus(userId) {
+  const res = await fetch(`${API_BASE}/integrations/yahoo/status?user_id=${encodeURIComponent(userId)}`);
+  return await handle(res);
+}
+
+export async function disconnectYahoo(userId) {
+  const res = await fetch(`${API_BASE}/integrations/yahoo?user_id=${encodeURIComponent(userId)}`, { method: "DELETE" });
+  return await handle(res);
+}

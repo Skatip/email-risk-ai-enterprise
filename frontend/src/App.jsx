@@ -9,6 +9,9 @@ import {
   googleConnectUrl,
   fetchGoogleStatus,
   disconnectGoogle,
+  yahooConnectUrl,
+  fetchYahooStatus,
+  disconnectYahoo,
 } from "./api";
 
 import EmailCard from "./components/EmailCard";
@@ -26,6 +29,16 @@ const PROVIDERS = [
     enabled: true,
     description:
       "Analyze Gmail inbox with priority, risk, replies, summaries, and reminders.",
+  },
+  {
+    id: "yahoo",
+    name: "Yahoo Mail",
+    logo: "yahoo",
+    email: "",
+    color: "yahoo",
+    enabled: true,
+    description:
+      "Connect securely with Yahoo OAuth. No app password or IMAP login.",
   },
   {
     id: "outlook",
@@ -147,6 +160,7 @@ function MiniBar({ label, value, max }) {
 function LandingPage({
   onChoose,
   onConnectGmail,
+  onConnectYahoo,
   theme,
   toggleTheme,
 }) {
@@ -180,6 +194,8 @@ function LandingPage({
               onClick={() =>
                 p.id === "gmail"
                   ? onConnectGmail()
+                  : p.id === "yahoo"
+                  ? onConnectYahoo()
                   : onChoose(p)
               }
             >
@@ -449,8 +465,9 @@ export default function App() {
     const params = new URLSearchParams(window.location.search);
     const callbackUserId = params.get("user_id");
     const gmailConnected = params.get("gmail") === "connected";
+    const yahooConnected = params.get("yahoo") === "connected";
 
-    if (gmailConnected && callbackUserId) {
+    if ((gmailConnected || yahooConnected) && callbackUserId) {
       localStorage.setItem("email_ai_user_id", callbackUserId);
       return callbackUserId;
     }
@@ -531,17 +548,25 @@ export default function App() {
     window.location.href = googleConnectUrl(freshUserId);
   }
 
-  async function switchGoogleAccount() {
+  function beginYahooConnection() {
+    const freshUserId = crypto.randomUUID();
+    localStorage.setItem("email_ai_pending_user_id", freshUserId);
+    window.location.href = yahooConnectUrl(freshUserId);
+  }
+
+  async function switchConnectedAccount() {
     setErr("");
     try {
-      if (userId) {
+      if (userId && provider === "yahoo") {
+        await disconnectYahoo(userId);
+      } else if (userId) {
         await disconnectGoogle(userId);
       }
     } catch (e) {
-      // Switching should still be possible if the old token has already expired.
-      console.log("Previous Google connection could not be disconnected:", e);
+      console.log("Previous mail connection could not be disconnected:", e);
     }
 
+    const previousProvider = provider;
     localStorage.removeItem("email_ai_user_id");
     localStorage.removeItem("email_ai_pending_user_id");
     setItems([]);
@@ -550,7 +575,12 @@ export default function App() {
     setFollowups([]);
     setWorkspace(null);
     setUserId("");
-    beginGoogleConnection();
+
+    if (previousProvider === "yahoo") {
+      beginYahooConnection();
+    } else {
+      beginGoogleConnection();
+    }
   }
 
   /*
@@ -591,68 +621,59 @@ export default function App() {
         return;
       }
 
-      try {
-        const status =
-          await fetchGoogleStatus(
-            userId
-          );
+      const params = new URLSearchParams(window.location.search);
+      const callbackProvider =
+        params.get("yahoo") === "connected"
+          ? "yahoo"
+          : params.get("gmail") === "connected"
+          ? "gmail"
+          : "";
 
-        if (cancelled) {
-          return;
+      try {
+        let status = null;
+        let restoredProvider = null;
+
+        if (callbackProvider === "yahoo") {
+          status = await fetchYahooStatus(userId);
+          restoredProvider = PROVIDERS.find((p) => p.id === "yahoo");
+        } else if (callbackProvider === "gmail") {
+          status = await fetchGoogleStatus(userId);
+          restoredProvider = PROVIDERS.find((p) => p.id === "gmail");
+        } else {
+          const googleStatus = await fetchGoogleStatus(userId).catch(() => null);
+          if (googleStatus?.connected) {
+            status = googleStatus;
+            restoredProvider = PROVIDERS.find((p) => p.id === "gmail");
+          } else {
+            const yahooStatus = await fetchYahooStatus(userId).catch(() => null);
+            if (yahooStatus?.connected) {
+              status = yahooStatus;
+              restoredProvider = PROVIDERS.find((p) => p.id === "yahoo");
+            }
+          }
         }
 
-        if (status?.connected) {
-          const gmailProvider =
-            PROVIDERS.find(
-              (p) =>
-                p.id === "gmail"
-            );
+        if (cancelled) return;
 
+        if (status?.connected && restoredProvider) {
           setWorkspace({
-            ...gmailProvider,
-            email:
-              status.email ||
-              gmailProvider?.email ||
-              "",
+            ...restoredProvider,
+            email: status.email || restoredProvider.email || "",
           });
-
-          /*
-           * Remove OAuth callback indicators such as:
-           *
-           * ?gmail=connected&email=...
-           *
-           * without refreshing the page.
-           */
-          const params =
-            new URLSearchParams(
-              window.location.search
-            );
 
           if (
             params.has("gmail") ||
+            params.has("yahoo") ||
             params.has("email") ||
             params.has("user_id")
           ) {
-            window.history.replaceState(
-              {},
-              document.title,
-              window.location.pathname
-            );
+            window.history.replaceState({}, document.title, window.location.pathname);
           }
         }
       } catch (e) {
-        /*
-         * A disconnected Gmail account is a valid state.
-         * Do not block the landing page.
-         */
-        console.log(
-          "Gmail connection not restored:",
-          e
-        );
+        console.log("Mail connection not restored:", e);
       } finally {
-        if (!cancelled) {
-          setCheckingGoogle(false);
-        }
+        if (!cancelled) setCheckingGoogle(false);
       }
     }
 
@@ -964,6 +985,7 @@ export default function App() {
       <LandingPage
         onChoose={setWorkspace}
         onConnectGmail={beginGoogleConnection}
+        onConnectYahoo={beginYahooConnection}
         theme={theme}
         toggleTheme={
           toggleTheme
@@ -1010,7 +1032,7 @@ export default function App() {
         <div className="headerRight">
           <button
             className="softBtn"
-            onClick={switchGoogleAccount}
+            onClick={switchConnectedAccount}
             title="Disconnect this Gmail workspace and connect a different Google account"
           >
             Switch account
