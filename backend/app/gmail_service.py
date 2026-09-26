@@ -2,6 +2,7 @@ import base64
 import os
 import re
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from bs4 import BeautifulSoup
 
@@ -11,7 +12,7 @@ from googleapiclient.discovery import build
 
 from app.config import settings
 from app.attachment_analysis import classify_attachment, attachment_risk
-from app.integration_store import get_connection
+from app.integration_store import get_connection, update_connection_credentials
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose"]
 
@@ -54,6 +55,12 @@ def gmail_service(user_id: str = ""):
     if not stored:
         raise RuntimeError("Gmail is not connected for this user")
     data = stored["credentials"]
+    expiry = None
+    if data.get("expiry"):
+        try:
+            expiry = datetime.fromisoformat(str(data["expiry"]).replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            expiry = None
     creds = Credentials(
         token=data.get("token"),
         refresh_token=data.get("refresh_token"),
@@ -61,9 +68,22 @@ def gmail_service(user_id: str = ""):
         client_id=data.get("client_id"),
         client_secret=data.get("client_secret"),
         scopes=data.get("scopes") or SCOPES,
+        expiry=expiry,
     )
-    if creds.expired and creds.refresh_token:
+    # Refresh server-side. The browser cookie/session is never the source of truth
+    # for Google refresh credentials. Persist the rotated access token + expiry.
+    if (not creds.valid or creds.expired) and creds.refresh_token:
         creds.refresh(Request())
+        refreshed = dict(data)
+        refreshed.update({
+            "token": creds.token,
+            "refresh_token": creds.refresh_token or data.get("refresh_token"),
+            "expiry": creds.expiry.isoformat() if creds.expiry else None,
+            "scopes": list(creds.scopes or data.get("scopes") or SCOPES),
+        })
+        update_connection_credentials(user_id, "google", refreshed, stored.get("account_email"))
+    if not creds.valid:
+        raise RuntimeError("Google authorization expired. Please reconnect Gmail.")
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
@@ -237,6 +257,7 @@ def _msg_to_email(msg: Dict[str, Any], include_body: bool = False) -> Dict[str, 
         "threadId": msg.get("threadId"),
         "from": headers.get("from", ""),
         "to": headers.get("to", ""),
+        "cc": headers.get("cc", ""),
         "subject": headers.get("subject", ""),
         "message_id_header": headers.get("message-id", ""),
         "in_reply_to": headers.get("in-reply-to", ""),
@@ -313,11 +334,15 @@ def fetch_inbox_fast(
                 userId="me",
                 id=message_id,
                 format="metadata",
-                metadataHeaders=["From", "Subject", "Date"],
+                metadataHeaders=["From", "To", "Cc", "Subject", "Date"],
             )
             .execute()
         )
         email = _msg_to_email(msg, include_body=False)
+        stored = get_connection(user_id, "google") if user_id else None
+        if stored:
+            email["authenticated_account_email"] = stored.get("account_email") or ""
+            email["authenticated_account_name"] = (stored.get("credentials") or {}).get("account_name") or ""
 
         if not _is_primary_like(email.get("labelIds", [])):
             continue
@@ -337,7 +362,12 @@ def fetch_email_body(message_id: str, user_id: str = "") -> Dict[str, Any]:
         .get(userId="me", id=message_id, format="full")
         .execute()
     )
-    return _msg_to_email(msg, include_body=True)
+    email = _msg_to_email(msg, include_body=True)
+    stored = get_connection(user_id, "google") if user_id else None
+    if stored:
+        email["authenticated_account_email"] = stored.get("account_email") or ""
+        email["authenticated_account_name"] = (stored.get("credentials") or {}).get("account_name") or ""
+    return email
 
 
 def fetch_emails(

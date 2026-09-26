@@ -26,6 +26,7 @@ from app.thread_summary_agent import summarize_thread
 from app.compose_from_notes_agent import write_from_notes
 from app.analytics_service import track_email_event, get_analytics_summary
 from app.attachment_analysis import analyze_attachment_bytes
+from app.risk_engine import compute_risk
 from app.attachment_bundle import content_hash, get_cached_attachment, save_cached_attachment, aggregate_attachment_intelligence
 
 try:
@@ -420,6 +421,11 @@ async def email_analyze(payload: Dict[str, Any] = Body(...)):
             attachment_context=attachment_context,
         )
 
+        deterministic_risk = compute_risk(
+            str(email.get("subject") or ""),
+            str(email.get("body") or email.get("snippet") or ""),
+            str(email.get("from") or ""),
+        )
         item = {
             **email,
             **semantic,
@@ -433,9 +439,11 @@ async def email_analyze(payload: Dict[str, Any] = Body(...)):
                 "sender_type": semantic.get("sender_type", "UNKNOWN"),
                 "direct_human": bool(semantic.get("direct_human", False)),
             },
-            "risk_signals": [],
-            "risk_reasons": [semantic.get("security_reason")] if semantic.get("security_event") and semantic.get("security_reason") else [],
-            "risk_urls": [],
+            "risk_signals": deterministic_risk.signals,
+            "risk_reasons": list(dict.fromkeys(
+                deterministic_risk.reasons + ([semantic.get("security_reason")] if semantic.get("security_event") and semantic.get("security_reason") else [])
+            )),
+            "risk_urls": deterministic_risk.urls,
             "attachment_analysis": attachment_result.get("attachment_analysis") or attachment_context or email.get("attachment_analysis") or [],
             "attachment_bundle": attachment_result.get("attachment_bundle") or email.get("attachment_bundle") or {},
             "attachment_reply_context": attachment_result.get("attachment_reply_context") or email.get("attachment_reply_context") or "",

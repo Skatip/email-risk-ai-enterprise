@@ -748,7 +748,21 @@ export default function App() {
     setItems((prev) => prev.map((x) => x.id === email.id ? { ...x, analysis_status: "loading" } : x));
     try {
       const analyzed = await analyzeEmail({ email, provider, user_email: activeEmail, user_id: userId });
-      setItems((prev) => prev.map((x) => x.id === email.id ? { ...x, ...analyzed, analysis_status: "done" } : x));
+      setItems((prev) => prev.map((x) => {
+        if (x.id !== email.id) return x;
+        // Deep analysis enriches the selected card, but opening/reading must never
+        // silently move it out of the current inbox/filter. Routing changes apply
+        // on the next explicit inbox refresh.
+        const routing = {
+          bucket: x.bucket,
+          inbox_score: x.inbox_score,
+          respond_recommended: x.respond_recommended,
+          reply_decision: x.reply_decision,
+          requires_action: x.requires_action,
+          direct_human: x.direct_human,
+        };
+        return { ...x, ...analyzed, ...routing, analysis_status: "done" };
+      }));
     } catch (e) {
       console.error("Deep email analysis failed:", e);
       setItems((prev) => prev.map((x) => x.id === email.id ? { ...x, analysis_status: "error" } : x));

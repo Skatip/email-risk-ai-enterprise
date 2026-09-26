@@ -7,7 +7,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
-from app.integration_store import get_connection
+from app.integration_store import get_connection, update_connection_credentials
 
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 
@@ -17,15 +17,26 @@ def _credentials(user_id: str) -> Credentials:
     if not stored:
         raise RuntimeError("Google account is not connected")
     data = stored["credentials"]
+    expiry = None
+    if data.get("expiry"):
+        try:
+            expiry = datetime.fromisoformat(str(data["expiry"]).replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            expiry = None
     creds = Credentials(
         token=data.get("token"), refresh_token=data.get("refresh_token"),
         token_uri=data.get("token_uri"), client_id=data.get("client_id"),
-        client_secret=data.get("client_secret"), scopes=data.get("scopes") or [],
+        client_secret=data.get("client_secret"), scopes=data.get("scopes") or [], expiry=expiry,
     )
     if CALENDAR_SCOPE not in set(creds.scopes or []):
         raise RuntimeError("Calendar permission is not granted. Reconnect Google once to enable availability checks.")
-    if creds.expired and creds.refresh_token:
+    if (not creds.valid or creds.expired) and creds.refresh_token:
         creds.refresh(Request())
+        refreshed = dict(data)
+        refreshed.update({"token": creds.token, "refresh_token": creds.refresh_token or data.get("refresh_token"), "expiry": creds.expiry.isoformat() if creds.expiry else None})
+        update_connection_credentials(user_id, "google", refreshed, stored.get("account_email"))
+    if not creds.valid:
+        raise RuntimeError("Google authorization expired. Please reconnect Google.")
     return creds
 
 

@@ -871,118 +871,48 @@ export default function EmailCard({ item, onPatchItem, onFollowupCreated, select
 
 
         <div className="tagRow">
-          {familyPersonal && (
-            <span className="glassTag signalIcon familySignal">👨‍👩‍👧 Family / Personal</span>
+          {familyPersonal && <span className="glassTag signalIcon familySignal">👨‍👩‍👧 Family / Personal</span>}
+          {securityRelated && <span className="glassTag signalIcon securitySignal">🔐 Security</span>}
+          {attachmentAnalyses.length > 0 && (
+            <span className="glassTag attachmentType">📎 {attachmentAnalyses.length} attachment{attachmentAnalyses.length === 1 ? "" : "s"}</span>
           )}
-
-          {securityRelated && (
-            <span className="glassTag signalIcon securitySignal">🔐 Security</span>
-          )}
-
-          {attachmentAnalyses.map((a, i) => (
-            <span key={`${a?.filename || i}-${a?.document_type || "doc"}`} className={`glassTag attachmentType ${String(a?.document_type || "").toLowerCase()}`}>
-              📎 {a?.document_label || a?.document_type || "Attachment"}
-            </span>
-          ))}
-
-          <span className={`glassTag band ${String(item?.sender_band || "UNKNOWN").toLowerCase()}`}>
-            {item?.sender_band || "UNKNOWN"}
-          </span>
-
-          <span className={`glassTag type ${senderType.toLowerCase()} ${familyPersonal ? "highlightIcon" : ""}`}>
-            {senderTypeIcon(senderType)} {senderType}
-          </span>
-
-          {item?.source_folder && (
-            <span className={`glassTag source ${String(item.source_folder).toLowerCase()}`}>
-              {String(item.source_folder).toUpperCase()}
-            </span>
-          )}
-
-          {item?.email_type && (
-            <span className={`glassTag emailtype ${String(item.email_type).toLowerCase()}`}>
-              {String(item.email_type).replaceAll("_", " ")}
-            </span>
-          )}
-
-          {item?.relationship_type && (
-            <span className={`glassTag relationship ${String(item.relationship_type).toLowerCase()}`}>
-              {String(item.relationship_type).replaceAll("_", " ")}
-            </span>
-          )}
-
-          {item?.intent && <span className="glassTag neutral">{item.intent}</span>}
-
-          {showPref && (
-            <span className={`glassTag pref ${userCat.toLowerCase()}`}>
-              {icon(userCat)} {userCat}
-            </span>
-          )}
+          {item?.intent && <span className="glassTag neutral">{String(item.intent).replaceAll("_", " ")}</span>}
         </div>
 
         <div className="primaryActions" onClick={(e) => e.stopPropagation()}>
           <button className="softBtn" onClick={() => setOpen((v) => !v)} type="button">
             {open ? "Hide analysis" : "Show analysis"}
           </button>
-
           <button
             className="softBtn primary"
             onClick={onGenerateOrRegenerate}
             disabled={loadingDraft}
-            title={!canReply && !replyNeedsFinalCheck ? noReplyReason(item) : "Let the Communication Brain understand the full message/thread and decide whether a reply is appropriate"}
+            title={!canReply && !replyNeedsFinalCheck ? noReplyReason(item) : "Generate a grounded reply"}
             type="button"
           >
             {replyButtonLabel(item, loadingDraft, Boolean(draft))}
           </button>
-
-          <button
-            className="softBtn"
-            onClick={onGenerateMulti}
-            disabled={loadingMulti || !canReply}
-            title={!canReply ? noReplyReason(item) : "Generate multiple reply options"}
-            type="button"
-          >
-            {loadingMulti ? "Generating..." : "Multi Reply"}
-          </button>
-
-          <button
-            className="softBtn"
-            onClick={onSummarizeThread}
-            disabled={loadingSummary}
-            type="button"
-          >
-            {loadingSummary ? "Summarizing..." : "Summarize Thread"}
-          </button>
-
-          <button
-            className="softBtn"
-            onClick={onCreateFollowup}
-            type="button"
-          >
-            Follow-up
-          </button>
-
+          <button className="softBtn" onClick={onCreateFollowup} type="button">Follow-up</button>
           {draft && !draft.safety_blocked && (
-            <button className="softBtn" onClick={onCopy} type="button">
-              {copied ? "Copied" : "Copy"}
-            </button>
+            <button className="softBtn" onClick={onCopy} type="button">{copied ? "Copied" : "Copy"}</button>
           )}
         </div>
 
-        <div className="feedbackRow" onClick={(e) => e.stopPropagation()}>
-          <button className="microBtn" onClick={() => onFeedback("IMPORTANT")} type="button">
-            ⭐ Important
-          </button>
-          <button className="microBtn" onClick={() => onFeedback("LESS")} type="button">
-            🕓 Less
-          </button>
-          <button className="microBtn" onClick={() => onFeedback("SPAM")} type="button">
-            🚫 Spam
-          </button>
-          <button className="microBtn" onClick={() => onFeedback("PROMO")} type="button">
-            🏷️ Promo
-          </button>
-        </div>
+        <details className="secondaryActions" onClick={(e) => e.stopPropagation()}>
+          <summary>More actions</summary>
+          <div className="primaryActions">
+            <button className="softBtn" onClick={onGenerateMulti} disabled={loadingMulti || !canReply} type="button">
+              {loadingMulti ? "Generating..." : "Multi Reply"}
+            </button>
+            <button className="softBtn" onClick={onSummarizeThread} disabled={loadingSummary} type="button">
+              {loadingSummary ? "Summarizing..." : "Summarize Thread"}
+            </button>
+            <button className="microBtn" onClick={() => onFeedback("IMPORTANT")} type="button">⭐ Important</button>
+            <button className="microBtn" onClick={() => onFeedback("LESS")} type="button">🕓 Less</button>
+            <button className="microBtn" onClick={() => onFeedback("SPAM")} type="button">🚫 Spam</button>
+            <button className="microBtn" onClick={() => onFeedback("PROMO")} type="button">🏷️ Promo</button>
+          </div>
+        </details>
 
         {calendarContext && String(calendarContext?.clarification_question || "").trim() && (
           <div className="notice schedulingQuestion" onClick={(e) => e.stopPropagation()}>

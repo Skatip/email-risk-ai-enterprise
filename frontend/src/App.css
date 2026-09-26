@@ -134,3 +134,7 @@ article.emailCard[data-provider="outlook"] {
   border-radius: 4px;
   font-weight: bold;
 }
+/* QA UX refinement: keep secondary actions available without crowding each card. */
+.secondaryActions { margin-top: 8px; }
+.secondaryActions > summary { cursor: pointer; opacity: .78; font-size: .86rem; user-select: none; }
+.secondaryActions[open] > summary { margin-bottom: 8px; }

@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List
 
 from app.ai.provider import AIProviderError, get_ai_provider
+from app.risk_engine import compute_risk
 
 
 TRIAGE_SYSTEM_PROMPT = """You are the semantic inbox triage layer for an AI communication assistant.
@@ -29,6 +30,8 @@ De-prioritize when no meaningful action/consequence exists:
 - low-value spam.
 
 Critical distinctions:
+- Recipient ownership matters. If authenticated_account_email is only in CC and not in To, do NOT assume the user owes a reply/follow-up merely because the message contains a request. Only mark reply/action if the message explicitly assigns or directly addresses the authenticated user.
+- Work/project/client/task/strategy correspondence is professional BUSINESS context, not PERSONAL, even when sent from a consumer email domain.
 - A company/job title containing the word 'security' is NOT a security event. security_event=true only for actual account access, authentication, password/MFA changes, suspicious activity, fraud, compromise, or comparable security incidents.
 - gmail.com/outlook.com/yahoo.com does NOT prove family/personal. Infer relationship from the message and conversation evidence.
 - 'job', 'university', 'course', 'recruiting', etc. do NOT automatically make a message important. Distinguish direct communication/application outcome from a bulk feed.
@@ -161,6 +164,58 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _address_contains(header: Any, address: Any) -> bool:
+    return bool(address) and str(address).lower() in str(header or "").lower()
+
+def _calibrate_priority(value: Any, *, security_event: bool = False, requires_action: bool = False) -> float:
+    p = _safe_float(value)
+    if security_event:
+        return round(max(0.82, min(0.96, 0.18 + 0.76 * p)), 3)
+    calibrated = 0.10 + 0.80 * p
+    if requires_action:
+        calibrated = max(calibrated, 0.58)
+    return round(max(0.05, min(0.94, calibrated)), 3)
+
+def _apply_deterministic_safety(item: Dict[str, Any], message: Dict[str, Any]) -> Dict[str, Any]:
+    account = str(message.get("authenticated_account_email") or "").strip().lower()
+    to_header, cc_header = message.get("to"), message.get("cc")
+    cc_only = bool(account and _address_contains(cc_header, account) and not _address_contains(to_header, account))
+    if cc_only:
+        item["recipient_role"] = "CC"
+        name = str(message.get("authenticated_account_name") or "").strip().lower()
+        body_text = f"{message.get('subject','')} {message.get('snippet','')} {message.get('body','')}".lower()
+        explicitly_addressed = bool(name and len(name) >= 3 and name in body_text)
+        # CC alone never creates reply ownership. Preserve the model's decision only
+        # when the message explicitly addresses the authenticated user by verified name.
+        if not explicitly_addressed:
+            item["respond_recommended"] = False
+            item["reply_decision"] = "NO_REPLY"
+            item["requires_action"] = False
+            if item.get("bucket") == "FOLLOW_UP":
+                item["bucket"] = "BUSINESS" if item.get("communication_type") != "AUTOMATED" else "INFORMATIONAL"
+    elif account and _address_contains(to_header, account):
+        item["recipient_role"] = "TO"
+    else:
+        item["recipient_role"] = "UNKNOWN"
+
+    text = f"{message.get('subject','')} {message.get('snippet','')} {message.get('body','')}"
+    deterministic_risk = compute_risk(str(message.get("subject") or ""), text, str(message.get("from") or ""))
+    if deterministic_risk.risk_score > float(item.get("risk") or 0):
+        item["risk"] = deterministic_risk.risk_score
+    if "exposed_secret" in deterministic_risk.signals:
+        item["security_event"] = True
+        item["security_reason"] = "Sensitive credential/API secret detected in message content."
+        item["bucket"] = "SECURITY"
+        item["inbox_score"] = max(float(item.get("inbox_score") or 0), 0.90)
+
+    if item.get("bucket") in {"BUSINESS", "RECRUITING"}:
+        if item.get("sender_type") == "PERSONAL": item["sender_type"] = "COMPANY"
+        if item.get("relationship_type") in {"PERSONAL", "FAMILY", "UNKNOWN"}: item["relationship_type"] = "PROFESSIONAL"
+
+    item["priority"] = _calibrate_priority(item.get("priority"), security_event=bool(item.get("security_event")), requires_action=bool(item.get("requires_action")))
+    item["label"] = "HIGH" if item["priority"] >= 0.72 else "MEDIUM" if item["priority"] >= 0.40 else "LOW"
+    return item
+
 def _normalize_item(raw: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
     priority = _safe_float(raw.get("priority"), 0.0)
     label = str(raw.get("label") or "").upper()
@@ -174,7 +229,7 @@ def _normalize_item(raw: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, 
     security_event = bool(raw.get("security_event"))
     respond = bool(raw.get("respond_recommended")) and decision in {"DRAFT_REPLY"}
 
-    return {
+    item = {
         "id": str(raw.get("id") or fallback.get("id") or ""),
         "inbox_score": _safe_float(raw.get("inbox_score"), priority),
         "priority": priority,
@@ -196,6 +251,7 @@ def _normalize_item(raw: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, 
         "priority_reason": _clip(raw.get("priority_reason") or raw.get("reason") or "", 220),
         "confidence": _safe_float(raw.get("confidence"), 0.5),
     }
+    return _apply_deterministic_safety(item, fallback)
 
 
 def _unavailable_item(original: Dict[str, Any]) -> Dict[str, Any]:
@@ -229,6 +285,9 @@ def _compact_payload(message: Dict[str, Any]) -> Dict[str, Any]:
         "id": str(message.get("id") or ""),
         "thread_id": message.get("threadId"),
         "from": _clip(message.get("from"), 180),
+        "to": _clip(message.get("to"), 220),
+        "cc": _clip(message.get("cc"), 220),
+        "authenticated_account_email": _clip(message.get("authenticated_account_email"), 180),
         "subject": _clip(message.get("subject"), 220),
         "snippet": _clip(message.get("snippet"), 420),
         "timestamp": message.get("ts"),
@@ -341,6 +400,8 @@ def analyze_message_semantics(
                 "thread_id": email.get("threadId"),
                 "from": _clip(email.get("from"), 260),
                 "to": _clip(email.get("to"), 260),
+                "cc": _clip(email.get("cc"), 260),
+                "authenticated_account_email": _clip(email.get("authenticated_account_email"), 180),
                 "subject": _clip(email.get("subject"), 420),
                 "body": _clip(email.get("body") or email.get("snippet"), 10000),
                 "timestamp": email.get("ts"),

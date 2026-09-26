@@ -22,6 +22,16 @@ _ASK_CRED = re.compile(r"\b(password|verify account|login|log in|sign in|confirm
 _URGENT = re.compile(r"\b(urgent|immediately|asap|act now|last chance|final warning|account will be closed|within 24 hours|today only)\b", re.I)
 _MONEY = re.compile(r"\b(wire|gift card|bitcoin|crypto|payment|refund|invoice|overdue|bank|payroll|direct deposit|transfer)\b", re.I)
 _ATTACHMENT = re.compile(r"\b(attachment|attached|invoice attached|open the file|download the file|enable macros|macro|zip file|password protected)\b", re.I)
+
+# Exposed secrets are a sensitivity/security issue even when the sender is legitimate.
+_SECRET_PATTERNS = [
+    ("openai_api_key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b")),
+    ("aws_access_key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
+    ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
+    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b")),
+    ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.I)),
+    ("generic_secret", re.compile(r"(?i)\b(?:api[_ -]?key|access[_ -]?token|client[_ -]?secret|secret[_ -]?key)\b\s*[:=]\s*[\"']?[A-Za-z0-9_./+\-=]{16,}")),
+]
 _SHORTENER_DOMAINS = {"bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd", "buff.ly", "cutt.ly", "rebrand.ly", "shorturl.at"}
 _SUSPICIOUS_TLDS = {"zip", "mov", "click", "top", "xyz", "tk", "ml", "ga", "cf", "gq"}
 _BRAND_WORDS = {"google", "gmail", "microsoft", "office", "outlook", "apple", "icloud", "paypal", "amazon", "facebook", "meta", "instagram", "bank", "chase", "wellsfargo"}
@@ -72,6 +82,14 @@ def compute_risk(subject: str, body: str, sender: str = "") -> RiskResult:
 
     sender_domain = _domain_from_sender(sender)
     links = _LINK_RE.findall(text)
+
+    exposed = [name for name, pattern in _SECRET_PATTERNS if pattern.search(text)]
+    if exposed:
+        # Do not echo the secret itself into logs/UI. Report only the type.
+        score = max(score, 0.90)
+        signals.append("exposed_secret")
+        signals.extend(f"secret:{name}" for name in exposed)
+        reasons.append("Sensitive credential or API secret appears to be exposed in the email content.")
 
     if links:
         score += 0.12

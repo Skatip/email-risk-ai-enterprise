@@ -200,17 +200,22 @@ def callback(
             detail="Google did not return an account email address.",
         )
 
+    existing = get_connection(user_id, "google", account_email)
+    existing_refresh = ((existing or {}).get("credentials") or {}).get("refresh_token")
     save_connection(
         user_id,
         "google",
         account_email,
         {
             "token": credentials.token,
-            "refresh_token": credentials.refresh_token,
+            # Google may omit refresh_token on a later authorization. Never erase a
+            # previously valid refresh token merely because this response omitted it.
+            "refresh_token": credentials.refresh_token or existing_refresh,
             "token_uri": credentials.token_uri,
             "client_id": credentials.client_id,
             "client_secret": credentials.client_secret,
             "scopes": sorted(granted_scopes),
+            "account_name": str(user_info.get("name") or "").strip(),
             "expiry": (
                 credentials.expiry.isoformat()
                 if credentials.expiry

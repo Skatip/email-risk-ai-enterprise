@@ -98,6 +98,22 @@ def get_connection(user_id: str, provider: str, account_email: str | None = None
     return item
 
 
+
+def update_connection_credentials(user_id: str, provider: str, credentials: Dict[str, Any], account_email: str | None = None) -> None:
+    """Persist rotated/refreshed OAuth credentials without changing account ownership."""
+    init_integration_store()
+    encrypted = _fernet().encrypt(json.dumps(credentials).encode()).decode()
+    now = int(time.time())
+    query = "UPDATE integration_connections SET encrypted_credentials=%s, updated_at=%s WHERE user_id=%s AND provider=%s AND status='connected'"
+    params: list[Any] = [encrypted, now, user_id, provider]
+    if account_email:
+        query += " AND account_email=%s"
+        params.append(account_email)
+    with psycopg.connect(_database_url()) as connection:
+        with connection.cursor() as cur:
+            cur.execute(query, params)
+        connection.commit()
+
 def delete_connection(user_id: str, provider: str, account_email: str | None = None) -> None:
     init_integration_store()
     query = "UPDATE integration_connections SET status='disconnected',updated_at=%s WHERE user_id=%s AND provider=%s"

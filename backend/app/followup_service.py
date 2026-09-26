@@ -31,17 +31,28 @@ def _missed_grace_seconds() -> int:
 
 
 def _refresh_temporal_states(cur, user_id: str, now: int) -> None:
+    # Meeting reminders are lifecycle reminders, not permanent overdue tasks. Once
+    # the meeting itself has passed, close the meeting reminder. A separate explicit
+    # post-meeting commitment can still create its own follow-up.
+    grace = _missed_grace_seconds()
+    cur.execute(
+        """UPDATE followup_reminders SET status='done', completed_at=COALESCE(completed_at, ?)
+           WHERE user_id=? AND status IN ('pending','due','missed','snoozed')
+             AND LOWER(COALESCE(reminder_kind,'')) IN ('meeting','calendar','appointment')
+             AND COALESCE(event_at,0) > 0 AND event_at + ? < ?""",
+        (now, user_id, grace, now),
+    )
     # A reminder becomes due as soon as its reminder time passes.
     cur.execute(
         """UPDATE followup_reminders SET status='due', triggered_at=COALESCE(triggered_at, ?)
            WHERE user_id=? AND status IN ('pending','snoozed') AND remind_at <= ?""",
         (now, user_id, now),
     )
-    # A meeting/deadline becomes missed shortly after the actual event time passes.
-    grace = _missed_grace_seconds()
+    # A non-meeting deadline becomes missed shortly after its actual event time passes.
     cur.execute(
         """UPDATE followup_reminders SET status='missed', triggered_at=COALESCE(triggered_at, ?)
            WHERE user_id=? AND status IN ('pending','due','snoozed')
+             AND LOWER(COALESCE(reminder_kind,'email')) NOT IN ('meeting','calendar','appointment')
              AND COALESCE(event_at, remind_at) > 0
              AND COALESCE(event_at, remind_at) + ? < ?""",
         (now, user_id, grace, now),
