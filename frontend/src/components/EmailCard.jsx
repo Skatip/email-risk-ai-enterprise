@@ -214,7 +214,16 @@ function formatThreadSummary(res) {
 
 function isFamilyPersonal(item) {
   const rel = String(item?.relationship_type || item?.relationship || "").toUpperCase();
-  return ["FAMILY_PERSONAL", "FAMILY", "PERSONAL"].includes(rel);
+  const communication = String(item?.communication_type || "").toUpperCase();
+  const directHuman = item?.direct_human === true || item?.human_signals?.direct_human === true;
+
+  // Family/Personal is a relationship signal, not a generic "personally relevant"
+  // label. Only show it when semantic analysis found a direct human relationship.
+  return (
+    ["FAMILY_PERSONAL", "FAMILY", "PERSONAL"].includes(rel) &&
+    directHuman &&
+    communication !== "AUTOMATED"
+  );
 }
 
 function isSecurityRelated(item) {

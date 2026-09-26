@@ -54,6 +54,8 @@ Rules:
 - Do not rely on keyword matching.
 - A company/name containing 'security' is not a security incident unless the event itself concerns account/fraud/security.
 - A consumer email domain does not establish a family/personal relationship.
+- FAMILY/PERSONAL relationship requires positive human-to-human relationship evidence from the message/thread. Automated service, account, billing, security, receipt, notification, or company-to-customer mail is not FAMILY/PERSONAL merely because it is personally relevant to the user.
+- Keep relationship separate from importance: an email can be highly consequential to the user while the sender relationship is COMPANY/SERVICE rather than PERSONAL.
 - Distinguish automated application/recruiting status updates from job feeds and from direct recruiter conversations.
 - Distinguish university newsletters from professor/advisor/administrative requests that require action.
 - Importance combines personal relevance, consequence, action, deadline, and relationship. It is not only urgency.
@@ -62,6 +64,7 @@ Rules:
 - Never invent dates, amounts, availability, decisions, commitments, identities, or document facts.
 - Detect concrete future obligations/reminders (meetings, deadlines, promised reviews, payments, callbacks). If a reminder is useful, return follow_up with needed=true and a grounded remind_at_unix. Resolve relative words such as "today" using current_unix and the message timestamp; if the time cannot be grounded, use null rather than guessing.
 - commitments must contain only explicit or strongly supported user obligations from the message/thread.
+- Assign exactly one product bucket using the same semantic taxonomy as inbox triage: IMPORTANT_NOW, CONVERSATIONAL, BUSINESS, RECRUITING, SECURITY, FOLLOW_UP, TRANSACTIONAL, INFORMATIONAL, JOB_FEED, MARKETING, SOCIAL, AUTOMATED_LOW_VALUE, SPAM. Base it on the meaning of this message, not a sender/domain shortcut.
 
 Use a semantic intent such as DIRECT_REQUEST, HUMAN_CONVERSATION, RECRUITING_UPDATE, APPLICATION_STATUS, MEETING_REQUEST, PAYMENT_OR_BILL, SECURITY_ALERT, TRAVEL_UPDATE, EDUCATION_ACTION, DOCUMENT_REVIEW, AUTOMATED_INFORMATION, NEWSLETTER, JOB_FEED, PROMOTION, SOCIAL_UPDATE, SPAM.
 Return only the required JSON fields."""
@@ -114,6 +117,7 @@ DEEP_SCHEMA: Dict[str, Any] = {
     "properties": {
         "priority": {"type": "number", "minimum": 0, "maximum": 1},
         "label": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
+        "bucket": {"type": "string", "enum": ["IMPORTANT_NOW", "CONVERSATIONAL", "BUSINESS", "RECRUITING", "SECURITY", "FOLLOW_UP", "TRANSACTIONAL", "INFORMATIONAL", "JOB_FEED", "MARKETING", "SOCIAL", "AUTOMATED_LOW_VALUE", "SPAM"]},
         "risk": {"type": "number", "minimum": 0, "maximum": 1},
         "intent": {"type": "string"},
         "sender_type": {"type": "string", "enum": ["PERSONAL", "COMPANY", "AUTOMATED", "UNKNOWN"]},
@@ -145,7 +149,7 @@ DEEP_SCHEMA: Dict[str, Any] = {
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     },
     "required": [
-        "priority", "label", "risk", "intent", "sender_type", "email_type", "relationship_type",
+        "priority", "label", "bucket", "risk", "intent", "sender_type", "email_type", "relationship_type",
         "direct_human", "requires_action", "security_event", "security_reason", "respond_recommended",
         "reply_decision", "reason", "priority_reason", "urgency", "known_facts", "unknown_facts", "follow_up", "commitments", "confidence",
     ],
@@ -209,8 +213,20 @@ def _apply_deterministic_safety(item: Dict[str, Any], message: Dict[str, Any]) -
         item["inbox_score"] = max(float(item.get("inbox_score") or 0), 0.90)
 
     if item.get("bucket") in {"BUSINESS", "RECRUITING"}:
-        if item.get("sender_type") == "PERSONAL": item["sender_type"] = "COMPANY"
-        if item.get("relationship_type") in {"PERSONAL", "FAMILY", "UNKNOWN"}: item["relationship_type"] = "PROFESSIONAL"
+        if item.get("sender_type") == "PERSONAL":
+            item["sender_type"] = "COMPANY"
+        if item.get("relationship_type") in {"PERSONAL", "FAMILY", "FAMILY_PERSONAL", "UNKNOWN"}:
+            item["relationship_type"] = "PROFESSIONAL"
+
+    # Semantic consistency guard, not a sender/domain rule: FAMILY/PERSONAL is a
+    # human relationship. Automated/service mail cannot become family/personal
+    # simply because its content is personally consequential to the recipient.
+    relationship = str(item.get("relationship_type") or "UNKNOWN").upper()
+    communication = str(item.get("communication_type") or "").upper()
+    if relationship in {"PERSONAL", "FAMILY", "FAMILY_PERSONAL"} and (
+        not bool(item.get("direct_human")) or communication == "AUTOMATED"
+    ):
+        item["relationship_type"] = "SERVICE" if item.get("sender_type") in {"COMPANY", "AUTOMATED"} else "UNKNOWN"
 
     item["priority"] = _calibrate_priority(item.get("priority"), security_event=bool(item.get("security_event")), requires_action=bool(item.get("requires_action")))
     item["label"] = "HIGH" if item["priority"] >= 0.72 else "MEDIUM" if item["priority"] >= 0.40 else "LOW"
