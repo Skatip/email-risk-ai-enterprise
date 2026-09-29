@@ -209,11 +209,11 @@ export async function syncEmailRag({ userId = "", maxMessages = 500, query = "in
   return await handle(res);
 }
 
-export async function askEmailAi({ userId = "", question = "" } = {}) {
+export async function askEmailAi({ userId = "", question = "", userTimezone = "" } = {}) {
   const res = await fetch(`${API_BASE}/rag/ask`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: userId, question }),
+    body: JSON.stringify({ user_id: userId, question, user_timezone: userTimezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC" }),
   });
   return await handle(res);
 }

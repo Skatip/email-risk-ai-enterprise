@@ -559,7 +559,7 @@ export default function App() {
     setChatQuestion(""); setChatLoading(true); setErr("");
     setChatMessages((m) => [...m, { role: "user", text: q }]);
     try {
-      const result = await askEmailAi({ userId, question: q });
+      const result = await askEmailAi({ userId, question: q, userTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone });
       setChatMessages((m) => [...m, { role: "assistant", text: result.answer, sources: result.sources || [] }]);
     } catch (e2) { setErr(e2.message); } finally { setChatLoading(false); }
   }

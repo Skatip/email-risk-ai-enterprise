@@ -166,7 +166,11 @@ async def _background_enrich_actionable_emails(emails: List[Dict[str, Any]], pro
     sem = asyncio.Semaphore(max(1, min(int(os.getenv("BACKGROUND_EMAIL_CONCURRENCY", "3")), 6)))
     async def one(card: Dict[str, Any]):
         intent = str(card.get("intent") or "").upper()
-        if not (card.get("requires_action") or card.get("respond_recommended") or any(x in intent for x in ("MEETING","CALENDAR","APPOINTMENT","PAYMENT","DEADLINE"))):
+        # Keep this path narrow. Generic actionable/reply emails do not need a
+        # second LLM pass during dashboard load; that caused avoidable contention
+        # and latency. Only temporal records that can create a Meeting/Reminder/
+        # grounded Deadline are reconciled here.
+        if not any(x in intent for x in ("MEETING", "CALENDAR", "APPOINTMENT", "PAYMENT", "DEADLINE", "DUE_DATE")):
             return
         async with sem:
             try:
@@ -176,7 +180,9 @@ async def _background_enrich_actionable_emails(emails: List[Dict[str, Any]], pro
                 await _persist_grounded_followup(email, semantic, provider, user_id)
             except Exception as exc:
                 print(f"Background intelligence warning for {card.get('id')}: {exc}")
-    await asyncio.gather(*(one(x) for x in emails), return_exceptions=True)
+    await asyncio.sleep(0.35)
+    temporal = [x for x in emails if any(t in str(x.get("intent") or "").upper() for t in ("MEETING", "CALENDAR", "APPOINTMENT", "PAYMENT", "DEADLINE", "DUE_DATE"))][:40]
+    await asyncio.gather(*(one(x) for x in temporal), return_exceptions=True)
 
 
 _ANALYZE_CACHE: Dict[str, Any] = {}
@@ -670,7 +676,8 @@ async def reply_generate(payload: Dict[str, Any] = Body(...)):
             result["respond_recommended"] = False
             result["needs_user_input"] = False
             result["event_lifecycle"] = "past_unknown"
-            result["clarification_question"] = "This meeting has already ended. Attendance is unknown; choose a post-meeting action before drafting a reply."
+            result["clarification_question"] = ""
+            result["reason"] = "This meeting has already ended. No RSVP or attendance input is requested for a past meeting."
 
         # Deterministic scheduling safety guard. Even if the model prematurely drafts
         # an acceptance, a scheduling message cannot produce a reply until the user
@@ -1002,7 +1009,8 @@ async def email_rag_ask(payload: Dict[str, Any] = Body(...)):
     user_id = str(payload.get("user_id") or "")
     question = str(payload.get("question") or "").strip()
     if not user_id or not question: raise HTTPException(status_code=400, detail="user_id and question are required")
-    return await asyncio.to_thread(answer_email_question, user_id, question)
+    user_timezone = str(payload.get("user_timezone") or "UTC")
+    return await asyncio.to_thread(answer_email_question, user_id, question, user_timezone)
 
 @app.get("/health")
 def health():
