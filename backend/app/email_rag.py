@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,7 +14,8 @@ from app.gmail_service import fetch_email_body, list_message_ids_paged
 from app.llm_clients import chat
 from app.ai.provider import get_ai_provider
 
-RAG_VERSION = "email-rag-v1"
+RAG_VERSION = "email-rag-v2"
+RAG_MAX_SCAN = max(500, min(int(os.getenv("EMAIL_RAG_MAX_SCAN", "5000")), 10000))
 
 
 def init_email_rag() -> None:
@@ -112,9 +114,15 @@ def sync_email_rag(user_id: str, max_messages: int = 500, query: str = "in:anywh
     for start in range(0,len(emails),50):
         batch=emails[start:start+50]
         texts=[_document_text(e) for e in batch]
-        try: vectors=provider.embed_many(texts)
+        try:
+            vectors=provider.embed_many(texts)
+            if len(vectors) != len(batch) or any(not v for v in vectors):
+                raise RuntimeError("Embedding provider returned an incomplete batch")
         except Exception:
-            vectors=[[] for _ in batch]; failed += len(batch)
+            # Do not persist empty embeddings as successfully indexed documents.
+            # Leaving this batch absent makes the next sync retry it automatically.
+            failed += len(batch)
+            continue
         now=int(time.time()); conn=connect(); cur=conn.cursor()
         for email,vector in zip(batch,vectors):
             eid=str(email.get('id') or '')
@@ -139,7 +147,7 @@ def rag_status(user_id: str) -> Dict[str, Any]:
     return {'indexed':int(row.get('n') or 0),'newest':int(row.get('newest') or 0),'oldest':int(row.get('oldest') or 0),'rag_version':RAG_VERSION}
 
 
-def retrieve_email_context(user_id: str, query: str, k: int = 8, max_scan: int = 1200) -> List[Dict[str, Any]]:
+def retrieve_email_context(user_id: str, query: str, k: int = 8, max_scan: int = RAG_MAX_SCAN) -> List[Dict[str, Any]]:
     qvec=embed_text(query) or []
     conn=connect(); cur=conn.cursor(); cur.execute('''SELECT email_id,thread_id,message_ts,sender,subject,body_text,snippet,embedding
       FROM email_rag_documents WHERE user_id=? AND provider='gmail' ORDER BY message_ts DESC LIMIT ?''',(user_id,max_scan)); rows=cur.fetchall(); conn.close()

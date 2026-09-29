@@ -107,10 +107,12 @@ def create_followup(
         """INSERT INTO followup_reminders(
             user_id,email_id,thread_id,remind_at,status,note,created_at,
             subject,sender,provider,triggered_at,completed_at,event_at,event_timezone,reminder_kind
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        RETURNING id""",
         (user_id, email_id, thread_id or "", remind_ts, "pending", note or "", _now(), subject or "", sender or "", provider or "gmail", None, None, event_ts or None, event_timezone or "", reminder_kind or "email"),
     )
-    new_id = cur.lastrowid
+    inserted = cur.fetchone()
+    new_id = inserted["id"] if inserted else None
     _refresh_temporal_states(cur, user_id, _now())
     conn.commit()
     row = cur.execute("SELECT * FROM followup_reminders WHERE id=? AND user_id=?", (new_id, user_id)).fetchone()

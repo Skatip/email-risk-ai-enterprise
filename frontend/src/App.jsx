@@ -764,6 +764,14 @@ export default function App() {
 
       // Fast path ends here. Full body/thread/OCR analysis is intentionally lazy:
       // it runs only when the user opens a message or requests a reply/action.
+      // Keep Ask Email-AI current without blocking inbox rendering. Existing RAG
+      // documents are skipped server-side, so this normally indexes only new mail.
+      window.setTimeout(() => {
+        syncEmailRag({ userId, maxMessages: 100, query: "in:anywhere" })
+          .then(() => fetchRagStatus(userId))
+          .then((status) => setRagStatus(status))
+          .catch((ragErr) => console.debug("Background RAG sync skipped:", ragErr));
+      }, 1500);
     } catch (e) {
       setErr(
         String(

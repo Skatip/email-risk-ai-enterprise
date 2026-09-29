@@ -24,14 +24,12 @@ class CursorCompat:
         return sql.replace("?", "%s")
 
     def execute(self, sql: str, params=()):
+        # Do not call LASTVAL() after every INSERT. Many tables (for example
+        # inbox_messages) do not use a sequence; PostgreSQL then raises an error
+        # and marks the whole transaction as aborted. Callers that need a
+        # generated id should use INSERT ... RETURNING id.
+        self.lastrowid = None
         self._cursor.execute(self._sql(sql), params)
-        if sql.lstrip().upper().startswith("INSERT"):
-            try:
-                self._cursor.execute("SELECT LASTVAL() AS id")
-                row = self._cursor.fetchone()
-                self.lastrowid = row["id"] if row else None
-            except Exception:
-                self.lastrowid = None
         return self
 
     def fetchone(self):
@@ -50,6 +48,9 @@ class ConnectionCompat:
 
     def commit(self):
         self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
 
     def close(self):
         self._conn.close()
