@@ -32,6 +32,7 @@ De-prioritize when no meaningful action/consequence exists:
 Critical distinctions:
 - Recipient ownership matters. If authenticated_account_email is only in CC and not in To, do NOT assume the user owes a reply/follow-up merely because the message contains a request. Only mark reply/action if the message explicitly assigns or directly addresses the authenticated user.
 - Work/project/client/task/strategy correspondence is professional BUSINESS context, not PERSONAL, even when sent from a consumer email domain.
+- A workplace meeting/session with organizer, colleagues/team attendees, project context, or enterprise conferencing evidence is PROFESSIONAL/BUSINESS unless the message contains positive evidence of an actual family/personal relationship. Do not label a work meeting FAMILY/PERSONAL just because a human sent it.
 - A company/job title containing the word 'security' is NOT a security event. security_event=true only for actual account access, authentication, password/MFA changes, suspicious activity, fraud, compromise, or comparable security incidents.
 - gmail.com/outlook.com/yahoo.com does NOT prove family/personal. Infer relationship from the message and conversation evidence.
 - 'job', 'university', 'course', 'recruiting', etc. do NOT automatically make a message important. Distinguish direct communication/application outcome from a bulk feed.
@@ -55,6 +56,7 @@ Rules:
 - A company/name containing 'security' is not a security incident unless the event itself concerns account/fraud/security.
 - A consumer email domain does not establish a family/personal relationship.
 - FAMILY/PERSONAL relationship requires positive human-to-human relationship evidence from the message/thread. Automated service, account, billing, security, receipt, notification, or company-to-customer mail is not FAMILY/PERSONAL merely because it is personally relevant to the user.
+- Workplace meetings, practice sessions, interviews, project discussions, and team invitations are PROFESSIONAL/BUSINESS when their context shows work/organization/team participation; never convert them to FAMILY/PERSONAL without positive personal-relationship evidence.
 - Keep relationship separate from importance: an email can be highly consequential to the user while the sender relationship is COMPANY/SERVICE rather than PERSONAL.
 - Distinguish automated application/recruiting status updates from job feeds and from direct recruiter conversations.
 - Distinguish university newsletters from professor/advisor/administrative requests that require action.

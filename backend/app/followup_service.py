@@ -84,9 +84,10 @@ def create_followup(
     conn = connect(); cur = conn.cursor()
     existing = cur.execute(
         """SELECT * FROM followup_reminders
-           WHERE user_id=? AND email_id=? AND status IN ('pending','due','missed','past_unknown','snoozed')
+           WHERE user_id=? AND email_id=? AND LOWER(COALESCE(reminder_kind,'email'))=LOWER(?)
+             AND status IN ('pending','due','missed','past_unknown','snoozed')
            ORDER BY remind_at ASC LIMIT 1""",
-        (user_id, email_id),
+        (user_id, email_id, reminder_kind or "email"),
     ).fetchone()
     if existing:
         # Correct previously stored guessed times when a grounded event time is now known.
