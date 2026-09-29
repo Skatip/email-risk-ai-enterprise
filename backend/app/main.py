@@ -10,7 +10,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.db import init_db, kv_get, kv_set
-from app.gmail_service import fetch_full_thread, fetch_inbox_fast, fetch_email_body, fetch_gmail_attachment, create_reply_draft
+from app.gmail_service import (fetch_full_thread, fetch_inbox_fast, fetch_email_body, fetch_gmail_attachment, create_reply_draft,
+    list_inbox_message_ids, fetch_message_metadata_batch)
 from app.calendar_service import free_busy
 from app.time_grounding import extract_requested_time
 from app.reply_agent import save_rag_example, load_reply_memories
@@ -20,6 +21,8 @@ from app.api.google_oauth import router as google_oauth_router
 from app.api.yahoo_oauth import router as yahoo_oauth_router
 from app.api.mcp_tools import router as mcp_tools_router
 from app.integration_store import init_integration_store
+from app.inbox_persistence import (init_inbox_persistence, load_messages, save_metadata, save_semantics, touch_messages, ANALYSIS_VERSION)
+from app.email_rag import init_email_rag, sync_email_rag, rag_status, answer_email_question
 from app.reply_multi import generate_multi
 from app.learning import record_feedback
 from app.thread_summary_agent import summarize_thread
@@ -225,6 +228,8 @@ def _startup():
     if kv_get("last_seen_ts") is None:
         kv_set("last_seen_ts", "0")
     init_integration_store()
+    init_inbox_persistence()
+    init_email_rag()
 
 
 @app.get("/inbox")
@@ -262,13 +267,25 @@ async def inbox_fast(
                 ),
             )
         else:
-            raw = await asyncio.to_thread(
-                fetch_inbox_fast,
-                query=_effective_query(query),
-                max_results=max(max_results * 3, 36),
-                scan_limit=max(max_results * 6, 72),
-                user_id=user_id,
+            # Latency path: Gmail list is cheap; Neon supplies metadata + semantic
+            # intelligence for messages we have already processed. Only genuinely new
+            # Gmail IDs require metadata fetch + Communication Brain work.
+            scan_limit = max(max_results * 6, 72)
+            discovered_ids = await asyncio.to_thread(
+                list_inbox_message_ids, _effective_query(query), scan_limit, user_id
             )
+            # Keep a bounded candidate window, matching the previous endpoint behavior.
+            discovered_ids = discovered_ids[:max(max_results * 3, 36)]
+            persisted = await asyncio.to_thread(load_messages, user_id, discovered_ids, "gmail")
+            missing_ids = [mid for mid in discovered_ids if mid not in persisted or not persisted[mid].get("metadata")]
+            fresh = []
+            if missing_ids:
+                fresh = await asyncio.to_thread(fetch_message_metadata_batch, missing_ids, user_id)
+                await asyncio.to_thread(save_metadata, user_id, fresh, "gmail")
+                for item in fresh:
+                    persisted[str(item.get("id"))] = {"metadata": item, "semantic": {}, "analysis_version": ""}
+            await asyncio.to_thread(touch_messages, user_id, discovered_ids, "gmail")
+            raw = [persisted[mid]["metadata"] for mid in discovered_ids if mid in persisted and persisted[mid].get("metadata")]
     except HTTPException:
         raise
     except Exception as e:
@@ -291,8 +308,22 @@ async def inbox_fast(
     triage_by_id: Dict[str, Dict[str, Any]] = {}
     if provider == "gmail" and candidates:
         try:
-            triaged = await asyncio.to_thread(triage_messages, candidates)
-            triage_by_id = {str(x.get("id")): x for x in triaged if x.get("id")}
+            # Reuse persisted Communication Brain output when the analysis contract
+            # is unchanged. This removes repeat LLM latency on every app launch.
+            persisted_now = await asyncio.to_thread(load_messages, user_id, [x.get("id") for x in candidates], "gmail")
+            to_triage = []
+            for item in candidates:
+                saved = persisted_now.get(str(item.get("id")), {})
+                semantic = saved.get("semantic") or {}
+                if semantic and saved.get("analysis_version") == ANALYSIS_VERSION:
+                    triage_by_id[str(item.get("id"))] = semantic
+                else:
+                    to_triage.append(item)
+            if to_triage:
+                triaged = await asyncio.to_thread(triage_messages, to_triage)
+                new_semantics = [x for x in triaged if x.get("id")]
+                triage_by_id.update({str(x.get("id")): x for x in new_semantics})
+                await asyncio.to_thread(save_semantics, user_id, new_semantics, "gmail")
         except Exception as triage_err:
             print(f"Semantic inbox triage warning: {triage_err}")
 
@@ -878,6 +909,29 @@ async def gmail_reply_draft(payload: Dict[str, Any] = Body(...)):
             detail += " Reconnect Google so Email-AI receives gmail.compose permission."
         raise HTTPException(status_code=500, detail=f"Gmail draft creation failed: {detail}")
 
+
+
+@app.get("/rag/status")
+async def email_rag_status(user_id: str = Query(default="")):
+    if not user_id: raise HTTPException(status_code=400, detail="user_id is required")
+    return await asyncio.to_thread(rag_status, user_id)
+
+
+@app.post("/rag/sync")
+async def email_rag_sync(payload: Dict[str, Any] = Body(...)):
+    user_id = str(payload.get("user_id") or "")
+    if not user_id: raise HTTPException(status_code=400, detail="user_id is required")
+    max_messages = max(1, min(int(payload.get("max_messages") or 500), 5000))
+    query = str(payload.get("query") or "in:anywhere")
+    return await asyncio.to_thread(sync_email_rag, user_id, max_messages, query)
+
+
+@app.post("/rag/ask")
+async def email_rag_ask(payload: Dict[str, Any] = Body(...)):
+    user_id = str(payload.get("user_id") or "")
+    question = str(payload.get("question") or "").strip()
+    if not user_id or not question: raise HTTPException(status_code=400, detail="user_id and question are required")
+    return await asyncio.to_thread(answer_email_question, user_id, question)
 
 @app.get("/health")
 def health():

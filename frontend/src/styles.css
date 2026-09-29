@@ -556,3 +556,21 @@ button:disabled { opacity: 0.65; cursor: not-allowed; }
 .reminderBanner.upcoming { border-color: rgba(16,163,127,.42); }
 .followupRow.missed { border-color: rgba(239,68,68,.55); }
 .scheduleTime { margin: 5px 0; color: var(--soft-text); font-weight: 600; }
+
+/* Ask Email-AI: grounded RAG over the user's own Neon email index. */
+.askEmailAiPage { margin: 18px; display: grid; gap: 14px; }
+.askEmailAiHeader { display:flex; justify-content:space-between; gap:18px; align-items:flex-start; padding:18px; border:1px solid var(--border); border-radius:16px; background:var(--card2); }
+.askEmailAiHeader h2 { margin:0 0 5px; }
+.askEmailAiHeader p { margin:0; color:var(--muted); max-width:760px; }
+.ragStatusBox { display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
+.askConversation { min-height:360px; max-height:58vh; overflow:auto; padding:16px; border:1px solid var(--border); border-radius:16px; background:var(--panel); display:flex; flex-direction:column; gap:12px; }
+.askEmpty { color:var(--muted); margin:auto; max-width:680px; text-align:center; line-height:1.6; }
+.chatBubble { max-width:82%; padding:12px 14px; border-radius:14px; line-height:1.5; white-space:pre-wrap; }
+.chatBubble.user { align-self:flex-end; background:var(--card2); border:1px solid var(--border); }
+.chatBubble.assistant { align-self:flex-start; background:var(--card2); border:1px solid var(--border); }
+.chatSources { display:grid; gap:6px; margin-top:10px; padding-top:9px; border-top:1px solid var(--border); }
+.chatSource { display:grid; gap:2px; font-size:12px; color:var(--muted); }
+.chatSource b { color:var(--soft-text); }
+.askComposer { display:flex; gap:10px; }
+.askComposer input { flex:1; min-width:0; padding:13px 14px; border-radius:12px; border:1px solid var(--border); background:var(--panel); color:var(--text); }
+@media (max-width:700px) { .askEmailAiHeader { flex-direction:column; } .ragStatusBox { justify-content:flex-start; } .chatBubble { max-width:94%; } }

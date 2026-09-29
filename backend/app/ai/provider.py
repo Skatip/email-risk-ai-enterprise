@@ -230,6 +230,17 @@ class OpenAIProvider:
             raise AIProviderError(f"OpenAI embedding request failed: {exc}") from exc
 
 
+    def embed_many(self, texts: Sequence[str]) -> list[list[float]]:
+        clean = [(x or "").strip()[:12000] for x in texts]
+        if not clean:
+            return []
+        try:
+            result = self.client.embeddings.create(model=self.embedding_model, input=clean)
+            return [list(item.embedding) for item in result.data]
+        except Exception as exc:
+            raise AIProviderError(f"OpenAI batch embedding request failed: {exc}")
+
+
 _provider: OpenAIProvider | None = None
 
 

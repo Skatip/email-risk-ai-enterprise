@@ -12,6 +12,9 @@ import {
   yahooConnectUrl,
   fetchYahooStatus,
   disconnectYahoo,
+  fetchRagStatus,
+  syncEmailRag,
+  askEmailAi,
 } from "./api";
 
 import EmailCard from "./components/EmailCard";
@@ -520,6 +523,38 @@ export default function App() {
 
   const [tab, setTab] =
     useState("inbox");
+
+  const [ragStatus, setRagStatus] = useState(null);
+  const [ragSyncing, setRagSyncing] = useState(false);
+  const [chatQuestion, setChatQuestion] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);
+
+  async function loadRagStatus() {
+    if (!userId) return;
+    try { setRagStatus(await fetchRagStatus(userId)); } catch (e) { setErr(e.message); }
+  }
+
+  async function syncRagHistory() {
+    if (!userId || ragSyncing) return;
+    setRagSyncing(true); setErr("");
+    try {
+      const result = await syncEmailRag({ userId, maxMessages: 500, query: "in:anywhere" });
+      setRagStatus({ indexed: (result.already_indexed || 0) + (result.indexed || 0), rag_version: result.rag_version });
+    } catch (e) { setErr(e.message); } finally { setRagSyncing(false); }
+  }
+
+  async function submitEmailQuestion(e) {
+    e?.preventDefault();
+    const q = chatQuestion.trim();
+    if (!q || !userId || chatLoading) return;
+    setChatQuestion(""); setChatLoading(true); setErr("");
+    setChatMessages((m) => [...m, { role: "user", text: q }]);
+    try {
+      const result = await askEmailAi({ userId, question: q });
+      setChatMessages((m) => [...m, { role: "assistant", text: result.answer, sources: result.sources || [] }]);
+    } catch (e2) { setErr(e2.message); } finally { setChatLoading(false); }
+  }
 
   const [
     analytics,
@@ -1131,6 +1166,13 @@ export default function App() {
         >
           Analytics
         </button>
+
+        <button
+          className={tab === "ask" ? "active" : ""}
+          onClick={() => { setTab("ask"); loadRagStatus(); }}
+        >
+          Ask Email-AI
+        </button>
       </nav>
 
       {activeReminder && (
@@ -1319,6 +1361,48 @@ export default function App() {
             }}
           />
         </main>
+      )}
+
+      {tab === "ask" && (
+        <section className="askEmailAiPage">
+          <div className="askEmailAiHeader">
+            <div>
+              <h2>Ask Email-AI</h2>
+              <p>Ask natural-language questions across your indexed old and current emails. Answers are grounded in retrieved email evidence.</p>
+            </div>
+            <div className="ragStatusBox">
+              <b>{ragStatus?.indexed || 0}</b><span> emails indexed</span>
+              <button className="softBtn" disabled={ragSyncing} onClick={syncRagHistory}>
+                {ragSyncing ? "Syncing history…" : "Sync email history"}
+              </button>
+            </div>
+          </div>
+          <div className="askConversation">
+            {chatMessages.length === 0 && (
+              <div className="askEmpty">Try: “What did the recruiter say about my interview?”, “Which bills need attention?”, or “Find the latest conversation about the project deadline.”</div>
+            )}
+            {chatMessages.map((m, i) => (
+              <div key={i} className={`chatBubble ${m.role}`}>
+                <div>{m.text}</div>
+                {m.sources?.length > 0 && (
+                  <div className="chatSources">
+                    {m.sources.slice(0, 6).map((src, j) => (
+                      <div key={`${src.email_id}-${j}`} className="chatSource">
+                        <b>[{j + 1}] {src.subject || "(no subject)"}</b>
+                        <span>{src.from || "Unknown sender"}{src.ts ? ` • ${fmtTime(src.ts)}` : ""}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+            {chatLoading && <div className="chatBubble assistant">Searching your emails…</div>}
+          </div>
+          <form className="askComposer" onSubmit={submitEmailQuestion}>
+            <input value={chatQuestion} onChange={(e) => setChatQuestion(e.target.value)} placeholder="Ask about your emails…" />
+            <button className="softBtn primary" type="submit" disabled={chatLoading || !chatQuestion.trim()}>Ask</button>
+          </form>
+        </section>
       )}
 
       {tab === "analytics" && (

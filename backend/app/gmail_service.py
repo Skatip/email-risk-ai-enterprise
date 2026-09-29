@@ -316,6 +316,62 @@ def _primary_and_spam_ids(user_query: str = "", scan_limit: int = 80, user_id: s
     return out
 
 
+
+
+def list_inbox_message_ids(query: str = "", scan_limit: int = 80, user_id: str = "") -> List[str]:
+    """Fast Gmail discovery using one authenticated service and list-only calls."""
+    svc = gmail_service(user_id)
+
+    def list_ids(q: str, include_spam: bool = False) -> List[str]:
+        resp = svc.users().messages().list(
+            userId="me", q=q, maxResults=scan_limit, includeSpamTrash=include_spam
+        ).execute()
+        return [m["id"] for m in (resp.get("messages", []) or [])]
+
+    primary = list_ids(_append_user_query(PRIMARY_QUERY, query), False)
+    if not primary:
+        primary = list_ids(_append_user_query(PRIMARY_FALLBACK_QUERY, query), False)
+    spam = list_ids(_append_user_query(SPAM_QUERY, query), True)
+    out, seen = [], set()
+    for mid in primary + spam:
+        if mid not in seen:
+            seen.add(mid); out.append(mid)
+    return out
+
+
+def fetch_message_metadata_batch(message_ids: List[str], user_id: str = "") -> List[Dict[str, Any]]:
+    """Fetch Gmail metadata in HTTP batches instead of one network round-trip per email."""
+    ids = [str(x) for x in message_ids if x]
+    if not ids:
+        return []
+    svc = gmail_service(user_id)
+    stored = get_connection(user_id, "google") if user_id else None
+    account_email = stored.get("account_email") or "" if stored else ""
+    account_name = (stored.get("credentials") or {}).get("account_name") or "" if stored else ""
+    found: Dict[str, Dict[str, Any]] = {}
+
+    def callback(request_id, response, exception):
+        if exception is not None or not response:
+            return
+        email = _msg_to_email(response, include_body=False)
+        if not _is_primary_like(email.get("labelIds", [])):
+            return
+        email["authenticated_account_email"] = account_email
+        email["authenticated_account_name"] = account_name
+        found[str(email.get("id"))] = email
+
+    for start in range(0, len(ids), 50):
+        batch = svc.new_batch_http_request(callback=callback)
+        for mid in ids[start:start + 50]:
+            req = svc.users().messages().get(
+                userId="me", id=mid, format="metadata",
+                metadataHeaders=["From", "To", "Cc", "Subject", "Date"],
+            )
+            batch.add(req, request_id=mid)
+        batch.execute()
+    return [found[mid] for mid in ids if mid in found]
+
+
 def fetch_inbox_fast(
     query: str = "",
     max_results: int = 10,
@@ -533,3 +589,24 @@ def create_reply_draft(
         "message_id": (draft.get("message") or {}).get("id"),
         "thread_id": (draft.get("message") or {}).get("threadId") or thread_id,
     }
+
+
+def list_message_ids_paged(query: str = "in:anywhere", max_results: int = 1000, user_id: str = "") -> List[str]:
+    """Page through Gmail IDs for RAG backfill. Retrieval only; no semantic rules."""
+    svc = gmail_service(user_id)
+    out: List[str] = []
+    page_token = None
+    target = max(1, min(int(max_results or 1000), 5000))
+    while len(out) < target:
+        resp = svc.users().messages().list(
+            userId="me",
+            q=query or "in:anywhere",
+            maxResults=min(500, target - len(out)),
+            pageToken=page_token,
+            includeSpamTrash=False,
+        ).execute()
+        out.extend([m["id"] for m in (resp.get("messages", []) or []) if m.get("id")])
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return out[:target]

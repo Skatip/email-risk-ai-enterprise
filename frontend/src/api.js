@@ -202,3 +202,26 @@ export async function disconnectYahoo(userId) {
   const res = await fetch(`${API_BASE}/integrations/yahoo?user_id=${encodeURIComponent(userId)}`, { method: "DELETE" });
   return await handle(res);
 }
+
+export async function fetchRagStatus(userId = "") {
+  const res = await fetch(`${API_BASE}/rag/status?user_id=${encodeURIComponent(userId)}`);
+  return await handle(res);
+}
+
+export async function syncEmailRag({ userId = "", maxMessages = 500, query = "in:anywhere" } = {}) {
+  const res = await fetch(`${API_BASE}/rag/sync`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, max_messages: maxMessages, query }),
+  });
+  return await handle(res);
+}
+
+export async function askEmailAi({ userId = "", question = "" } = {}) {
+  const res = await fetch(`${API_BASE}/rag/ask`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, question }),
+  });
+  return await handle(res);
+}
