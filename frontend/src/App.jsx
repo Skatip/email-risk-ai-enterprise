@@ -393,31 +393,6 @@ function MeetingsPanel({ meetings, onRefresh }) {
   );
 }
 
-function ReminderPanel({ reminders, onDone, onRefresh }) {
-  const rows = (reminders || []).filter((r) => String(r?.reminder_kind || "").toLowerCase() !== "followup");
-  return (
-    <div className="panelCard full">
-      <div className="panelHeader">
-        <div><h3>Reminders</h3><p>Timed alerts for meetings and grounded deadlines. Reminders are separate from follow-ups.</p></div>
-        <button className="softBtn" onClick={onRefresh}>Refresh reminders</button>
-      </div>
-      {rows.length === 0 && <div className="emptyState">No reminders right now.</div>}
-      {rows.map((r) => (
-        <div key={r.id} className={`followupRow ${r.status}`}>
-          <div>
-            <b>{r.subject || r.email_id || "Reminder"}</b>
-            <p>{r.note || "Reminder"}</p>
-            <small>{r.sender || r.provider || "email"} • reminder {fmtTime(r.remind_at)}{r.event_at ? ` • event ${fmtTime(r.event_at)}` : ""}{r.event_timezone ? ` • ${r.event_timezone}` : ""} • {reminderStateText(r)}</small>
-          </div>
-          {!['done','dismissed','past_unknown'].includes(String(r.status || '').toLowerCase()) && (
-            <button className="softBtn primary" onClick={() => onDone(r.id)}>Mark done</button>
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
-
 function FollowupPanel({
   followups,
   onDone,
@@ -856,11 +831,6 @@ export default function App() {
     }
   }
 
-  async function markReminderDone(id) {
-    await updateFollowupStatus(id, "done", userId);
-    await loadFollowups();
-  }
-
   /*
    * Once a workspace exists,
    * automatically load its data.
@@ -1165,13 +1135,6 @@ export default function App() {
         </button>
 
         <button
-          className={tab === "reminders" ? "active" : ""}
-          onClick={() => { setTab("reminders"); loadFollowups(); }}
-        >
-          Reminders
-        </button>
-
-        <button
           className={
             tab === "followups"
               ? "active"
@@ -1375,10 +1338,6 @@ export default function App() {
             />
           </main>
         </>
-      )}
-
-      {tab === "reminders" && (
-        <main className="contentArea"><ReminderPanel reminders={reminders} onDone={markReminderDone} onRefresh={loadFollowups} /></main>
       )}
 
       {tab === "meetings" && (

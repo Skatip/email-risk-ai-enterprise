@@ -83,7 +83,6 @@ function seedDraftFromItem(item) {
   if (!item) return null;
   // Never surface a pre-generated meeting acceptance before the user has made
   // the availability decision. Calendar-free is not user consent.
-  if (String(item?.event_lifecycle || "").toLowerCase() === "past_unknown") return null;
   if (isSchedulingItem(item) && item?.availability_confirmed_by_user !== true) return null;
 
   const replyText =
@@ -884,10 +883,6 @@ export default function EmailCard({ item, onPatchItem, onFollowupCreated, select
           </div>
         )}
 
-
-        {String(item?.event_lifecycle || "").toLowerCase() === "past_unknown" && (
-          <div className="notice">Meeting ended · attendance unknown. No RSVP or future-attendance reply will be generated.</div>
-        )}
 
         <div className="tagRow">
           {familyPersonal && <span className="glassTag signalIcon familySignal">👨‍👩‍👧 Family / Personal</span>}

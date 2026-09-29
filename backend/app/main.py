@@ -14,7 +14,6 @@ from app.gmail_service import (fetch_full_thread, fetch_inbox_fast, fetch_email_
     list_inbox_message_ids, fetch_message_metadata_batch)
 from app.calendar_service import free_busy
 from app.time_grounding import extract_requested_time, extract_ics_time
-from app.inbox_policy import is_meeting_candidate as _is_meeting_candidate, focus_eligible as _focus_eligible
 from app.reply_agent import save_rag_example, load_reply_memories
 from app.communication_brain.orchestrator import process_communication
 from app.communication_brain.triage import triage_messages, analyze_message_semantics
@@ -77,8 +76,16 @@ def _labels_text(item: Dict[str, Any]) -> str:
 
 
 def _is_scheduling_request(email: Dict[str, Any], analysis: Dict[str, Any]) -> bool:
-    semantic = " ".join(str((analysis or {}).get(k) or "") for k in ("intent", "message_type", "reply_decision", "sender_expectation")).upper()
-    return any(token in semantic for token in ("MEETING", "SCHEDUL", "APPOINTMENT", "CALENDAR"))
+    """Use Brain judgment plus factual calendar attachments; never keyword-classify meaning."""
+    if bool((analysis or {}).get("meeting_related")):
+        return True
+    for att in (email.get("attachments") or []):
+        filename = str(att.get("filename") or "").lower()
+        mime = str(att.get("mimeType") or att.get("mime_type") or "").lower()
+        if filename.endswith(".ics") or "text/calendar" in mime:
+            return True
+    return False
+
 
 def _ground_followup_time(email: Dict[str, Any], follow: Dict[str, Any], scheduling: bool = False) -> Dict[str, Any]:
     """Prefer a deterministic time parsed from the email over an LLM-guessed timestamp."""
@@ -131,23 +138,24 @@ async def _persist_grounded_followup(email: Dict[str, Any], semantic: Dict[str, 
         await asyncio.to_thread(upsert_from_followup, user_id, email, timing, semantic, provider)
         # A meeting reminder is a reminder, not a Follow-up; it is stored in the
         # reminder table but filtered from the Follow-ups UI.
-        await asyncio.to_thread(
-            create_followup, email.get("id", ""), timing["remind_at"],
-            follow.get("note") or f"Reminder for {email.get('subject') or 'meeting'}",
-            email.get("threadId", ""), email.get("subject", ""), email.get("from", ""),
-            provider, user_id, timing["event_at"], timing["event_timezone"], "meeting",
-        )
+        if int(timing.get("event_at") or 0) > int(time.time()):
+            await asyncio.to_thread(
+                create_followup, email.get("id", ""), timing["remind_at"],
+                follow.get("note") or f"Reminder for {email.get('subject') or 'meeting'}",
+                email.get("threadId", ""), email.get("subject", ""), email.get("from", ""),
+                provider, user_id, timing["event_at"], timing["event_timezone"], "meeting",
+            )
         semantic["grounded_timing"] = timing
         return True
 
     if security_only or not follow.get("needed"):
         return False
-    if int(timing.get("remind_at") or 0) <= 0:
-        return False
 
-    # Non-meeting actions need a genuinely grounded deadline/reminder.
+    # A conversational follow-up may be unresolved without having a deadline. Keep
+    # it in Follow-ups with remind_at=0 rather than inventing a time. Timed reminders
+    # are created only when the Brain/context provides a grounded timestamp.
     await asyncio.to_thread(
-        create_followup, email.get("id", ""), timing["remind_at"],
+        create_followup, email.get("id", ""), int(timing.get("remind_at") or 0),
         follow.get("note") or follow.get("reason") or "Follow up on this email",
         email.get("threadId", ""), email.get("subject", ""), email.get("from", ""),
         provider, user_id, timing["event_at"], timing["event_timezone"], "followup",
@@ -160,57 +168,27 @@ async def _persist_grounded_followup(email: Dict[str, Any], semantic: Dict[str, 
 
 
 async def _background_enrich_actionable_emails(emails: List[Dict[str, Any]], provider: str, user_id: str) -> None:
-    """Persist meetings/reminders from inbox evidence without requiring an email click.
-
-    This runs only after the inbox response. It prefers deterministic subject/ICS
-    grounding and does not perform a second LLM analysis pass.
-    """
+    """Create meeting/deadline intelligence without requiring the user to open the email."""
     if provider != "gmail" or not user_id:
         return
-    await asyncio.sleep(0.8)
-    candidates = [x for x in emails if _is_meeting_candidate(x, x)][:60]
-    sem = asyncio.Semaphore(max(1, min(int(os.getenv("BACKGROUND_MEETING_CONCURRENCY", "2")), 3)))
-
+    sem = asyncio.Semaphore(max(1, min(int(os.getenv("BACKGROUND_EMAIL_CONCURRENCY", "3")), 6)))
     async def one(card: Dict[str, Any]):
+        # The Communication Brain decides whether deeper temporal persistence is useful.
+        # Factual calendar attachments are also eligible because their event data is explicit.
+        has_ics = any(str(a.get("filename") or "").lower().endswith(".ics") or "text/calendar" in str(a.get("mimeType") or a.get("mime_type") or "").lower() for a in (card.get("attachments") or []))
+        if not (bool(card.get("meeting_related")) or bool(card.get("follow_up_needed")) or has_ics):
+            return
         async with sem:
             try:
-                timing = extract_requested_time(card)
-                attachments = card.get("attachments") or []
-                ics = [a for a in attachments if str(a.get("filename") or "").lower().endswith(".ics") or "text/calendar" in str(a.get("mimeType") or a.get("mime_type") or "").lower()]
-                for att in ics[:1]:
-                    aid = att.get("attachmentId") or att.get("attachment_id")
-                    if aid:
-                        data = await asyncio.to_thread(fetch_gmail_attachment, str(card.get("id")), str(aid), user_id)
-                        timing = extract_ics_time(data) or timing
-                if not timing or int(timing.get("event_at_unix") or 0) <= 0:
-                    return
-                semantic = {
-                    "intent": str(card.get("intent") or "MEETING_REQUEST"),
-                    "reason": str(card.get("reason") or "Meeting detected from inbox evidence."),
-                    "priority_reason": str(card.get("priority_reason") or ""),
-                    "confidence": float(card.get("triage_confidence") or 0.8),
-                }
-                grounded = {
-                    "event_at": int(timing["event_at_unix"]),
-                    "remind_at": max(1, int(timing["event_at_unix"]) - max(0, min(int(os.getenv("MEETING_REMINDER_LEAD_SECONDS", "900")), 86400))),
-                    "event_timezone": timing.get("timezone") or "",
-                    "reminder_kind": "meeting",
-                    "requested_time": timing,
-                }
-                await asyncio.to_thread(upsert_from_followup, user_id, card, grounded, semantic, provider)
-                # Only create a future reminder. Past meetings belong in Meetings,
-                # not as newly-created reminders/follow-ups.
-                if int(grounded["event_at"]) > int(time.time()):
-                    await asyncio.to_thread(create_followup, card.get("id", ""), grounded["remind_at"], f"Reminder for {card.get('subject') or 'meeting'}", card.get("threadId", ""), card.get("subject", ""), card.get("from", ""), provider, user_id, grounded["event_at"], grounded["event_timezone"], "meeting")
-                    # RSVP/acknowledgement is a separate Follow-up only when triage
-                    # says the user actually owes an action/reply. Its deadline is
-                    # the grounded meeting start; no synthetic timer is invented.
-                    if card.get("requires_action") or card.get("respond_recommended"):
-                        await asyncio.to_thread(create_followup, card.get("id", ""), grounded["event_at"], f"Respond to {card.get('subject') or 'meeting invitation'}", card.get("threadId", ""), card.get("subject", ""), card.get("from", ""), provider, user_id, grounded["event_at"], grounded["event_timezone"], "followup")
+                full = await asyncio.to_thread(fetch_email_body, card.get("id"), user_id)
+                email = {**card, **full}
+                semantic = await asyncio.to_thread(analyze_message_semantics, email, card, thread=[], attachment_context=[])
+                await _persist_grounded_followup(email, semantic, provider, user_id)
             except Exception as exc:
-                print(f"Background meeting reconciliation warning for {card.get('id')}: {exc}")
-
-    await asyncio.gather(*(one(x) for x in candidates), return_exceptions=True)
+                print(f"Background intelligence warning for {card.get('id')}: {exc}")
+    await asyncio.sleep(0.35)
+    temporal = [x for x in emails if bool(x.get("meeting_related")) or bool(x.get("follow_up_needed")) or any(str(a.get("filename") or "").lower().endswith(".ics") or "text/calendar" in str(a.get("mimeType") or a.get("mime_type") or "").lower() for a in (x.get("attachments") or []))][:40]
+    await asyncio.gather(*(one(x) for x in temporal), return_exceptions=True)
 
 
 _ANALYZE_CACHE: Dict[str, Any] = {}
@@ -371,52 +349,29 @@ async def inbox_fast(
         seen_threads.add(thread_key)
         candidates.append(e)
 
-    # Reuse persisted semantic intelligence. For unseen mail, triage newest-first
-    # in bounded chunks and stop once the requested Focus count is satisfied. This
-    # keeps first paint fast while preserving the exact newest-N Focus semantics.
+    # Gmail folders are retrieval sources only. The Communication Brain decides
+    # what deserves space in the intelligent inbox. One compact batched call keeps
+    # token/cost usage bounded while preventing newsletters/job feeds from crowding
+    # out direct human and important messages.
     triage_by_id: Dict[str, Dict[str, Any]] = {}
-    requested_bucket = (bucket or "FOCUS").upper()
     if provider == "gmail" and candidates:
         try:
+            # Reuse persisted Communication Brain output when the analysis contract
+            # is unchanged. This removes repeat LLM latency on every app launch.
             persisted_now = await asyncio.to_thread(load_messages, user_id, [x.get("id") for x in candidates], "gmail")
-            pending = []
+            to_triage = []
             for item in candidates:
                 saved = persisted_now.get(str(item.get("id")), {})
                 semantic = saved.get("semantic") or {}
                 if semantic and saved.get("analysis_version") == ANALYSIS_VERSION:
                     triage_by_id[str(item.get("id"))] = semantic
                 else:
-                    pending.append(item)
-
-            chunk_size = max(8, min(24, int(os.getenv("INBOX_FIRST_PAINT_TRIAGE_CHUNK", "16"))))
-
-            def enough_focus_in_known_prefix() -> bool:
-                if requested_bucket not in {"FOCUS", "IMPORTANT"}:
-                    return False
-                qualified = 0
-                for c in candidates:
-                    semx = triage_by_id.get(str(c.get("id")))
-                    if semx is None:
-                        break
-                    if _focus_eligible({**semx, "ts": c.get("ts", 0)}):
-                        qualified += 1
-                return qualified >= max_results
-
-            # On repeat loads, if the newest persisted prefix already contains the
-            # requested N Focus messages, make zero new LLM calls.
-            if enough_focus_in_known_prefix():
-                pending = []
-
-            for start_idx in range(0, len(pending), chunk_size):
-                chunk = pending[start_idx:start_idx + chunk_size]
-                triaged = await asyncio.to_thread(triage_messages, chunk)
-                fresh_semantics = [x for x in triaged if x.get("id")]
-                triage_by_id.update({str(x.get("id")): x for x in fresh_semantics})
-                await asyncio.to_thread(save_semantics, user_id, fresh_semantics, "gmail")
-                # Because candidates/pending are newest-first, once enough of the
-                # processed prefix qualify, older unseen messages cannot displace them.
-                if enough_focus_in_known_prefix():
-                    break
+                    to_triage.append(item)
+            if to_triage:
+                triaged = await asyncio.to_thread(triage_messages, to_triage)
+                new_semantics = [x for x in triaged if x.get("id")]
+                triage_by_id.update({str(x.get("id")): x for x in new_semantics})
+                await asyncio.to_thread(save_semantics, user_id, new_semantics, "gmail")
         except Exception as triage_err:
             print(f"Semantic inbox triage warning: {triage_err}")
 
@@ -459,6 +414,8 @@ async def inbox_fast(
             "security_event": bool(semantic.get("security_event", False)),
             "security_reason": semantic.get("security_reason") or "",
             "triage_confidence": float(semantic.get("confidence", 0.0) or 0.0),
+            "meeting_related": bool(semantic.get("meeting_related", False)),
+            "follow_up_needed": bool(semantic.get("follow_up_needed", False)),
             "human_signals": {"sender_type": sender_type},
             "analysis_status": "triaged" if semantic else "pending",
             "source_folder": e.get("source_folder", ""),
@@ -470,30 +427,6 @@ async def inbox_fast(
             "mail_scope": "SEMANTIC_PRIMARY_AND_SPAM_LAST_7_DAYS" if provider == "gmail" else "FAST_INBOX",
         })
 
-    # Apply persisted meeting lifecycle to inbox cards before the UI decides
-    # whether to offer RSVP/reply actions. This makes past-event safety independent
-    # of whether the user has opened/deep-analyzed the email.
-    if user_id:
-        try:
-            obligation_rows = await asyncio.to_thread(query_obligations, user_id, 200)
-            meeting_by_email = {str(r.get("email_id")): r for r in obligation_rows if str(r.get("kind") or "").lower() in {"meeting", "calendar", "appointment"}}
-            now_unix = int(time.time())
-            for card in out:
-                mr = meeting_by_email.get(str(card.get("id")))
-                if not mr:
-                    continue
-                due_at = int(mr.get("due_at") or 0)
-                card["meeting_event_at"] = due_at
-                card["meeting_timezone"] = mr.get("timezone") or ""
-                card["event_lifecycle"] = "past_unknown" if due_at and due_at < now_unix else "upcoming"
-                if card["event_lifecycle"] == "past_unknown":
-                    card["reply_decision"] = "PAST_EVENT"
-                    card["respond_recommended"] = False
-                    card["requires_action"] = False
-                    card["reason"] = "This meeting has already ended. Attendance is unknown."
-        except Exception as lifecycle_err:
-            print(f"Meeting lifecycle overlay warning: {lifecycle_err}")
-
     if triage_by_id:
         out.sort(key=lambda x: (float(x.get("inbox_score", 0.0)), float(x.get("priority", 0.0)), int(x.get("ts", 0))), reverse=True)
     else:
@@ -504,11 +437,12 @@ async def inbox_fast(
     # because the user is currently viewing another inbox bucket.
     background_candidates = list(out)
 
+    requested_bucket = (bucket or "FOCUS").upper()
     if requested_bucket in {"FOCUS", "IMPORTANT"}:
-        out = [x for x in out if _focus_eligible(x)]
-        # Focus means the newest N messages that qualify as important, matching the
-        # user's Gmail chronology. Old 94% alerts must not crowd out newer important mail.
-        out.sort(key=lambda x: int(x.get("ts", 0)), reverse=True)
+        # Focus is the Brain's contextual attention ranking over recent Primary+Spam.
+        # No sender/domain/keyword/priority threshold decides importance here.
+        out = [x for x in out if str(x.get("bucket") or "").upper() == "IMPORTANT_NOW"]
+        out.sort(key=lambda x: (float(x.get("inbox_score", 0.0)), int(x.get("ts", 0))), reverse=True)
     elif requested_bucket == "NEEDS_REPLY":
         out = [x for x in out if x.get("respond_recommended") or str(x.get("reply_decision") or "").upper() == "DRAFT_REPLY"]
     elif requested_bucket == "PEOPLE":
@@ -541,10 +475,9 @@ async def _reconcile_cached_meetings(user_id: str, limit: int = 180) -> None:
     rows = await asyncio.to_thread(load_recent_messages, user_id, "gmail", limit)
     for card in rows:
         sem = card.get("_semantic") or {}
-        intent = str(sem.get("intent") or "").upper()
         attachments = card.get("attachments") or []
         has_ics = any(str(a.get("filename") or "").lower().endswith(".ics") or "text/calendar" in str(a.get("mimeType") or a.get("mime_type") or "").lower() for a in attachments)
-        semantic_meeting = _is_meeting_candidate(card, sem)
+        semantic_meeting = bool(sem.get("meeting_related"))
         if not (has_ics or semantic_meeting):
             continue
         timing = extract_requested_time(card)
@@ -572,7 +505,7 @@ async def _reconcile_cached_meetings(user_id: str, limit: int = 180) -> None:
                 timing = None
         if not timing or int(timing.get("event_at_unix") or 0) <= 0:
             continue
-        normalized = {**sem, "intent": intent or "MEETING_REQUEST"}
+        normalized = {**sem, "meeting_related": True}
         grounded = {
             "event_at": int(timing["event_at_unix"]),
             "remind_at": max(1, int(timing["event_at_unix"]) - max(0, min(int(os.getenv("MEETING_REMINDER_LEAD_SECONDS", "900")), 86400))),
@@ -581,9 +514,8 @@ async def _reconcile_cached_meetings(user_id: str, limit: int = 180) -> None:
             "requested_time": timing,
         }
         await asyncio.to_thread(upsert_from_followup, user_id, card, grounded, normalized, "gmail")
-        # Keep reminder separate from meeting registry and never create a new
-        # pre-meeting reminder after the event has already ended.
-        if int(grounded["event_at"]) > int(time.time()):
+        # Keep reminder separate from meeting registry.
+        if int(grounded.get("event_at") or 0) > int(time.time()):
             try:
                 await asyncio.to_thread(create_followup, card.get("id", ""), grounded["remind_at"], f"Reminder for {card.get('subject') or 'meeting'}", card.get("threadId", ""), card.get("subject", ""), card.get("from", ""), "gmail", user_id, grounded["event_at"], grounded["event_timezone"], "meeting")
             except Exception as exc:
@@ -817,15 +749,16 @@ async def reply_generate(payload: Dict[str, Any] = Body(...)):
         scheduling = _is_scheduling_request(email, {**analysis, **result})
         grounded_for_reply = extract_requested_time(email) if scheduling else None
         grounded_event_at = int((grounded_for_reply or {}).get("event_at_unix") or 0)
-        if scheduling and grounded_event_at and grounded_event_at < int(time.time()):
-            result["decision"] = "PAST_EVENT"
+        attendance_confirmation = str(user_preferences.get("attendance_confirmation") or "").strip().lower()
+        if scheduling and grounded_event_at and grounded_event_at < int(time.time()) and not attendance_confirmation:
+            result["decision"] = "ASK_USER"
             result["reply"] = ""
             result["should_reply"] = False
             result["respond_recommended"] = False
-            result["needs_user_input"] = False
+            result["needs_user_input"] = True
             result["event_lifecycle"] = "past_unknown"
-            result["clarification_question"] = ""
-            result["reason"] = "This meeting has already ended. No RSVP or attendance input is requested for a past meeting."
+            result["clarification_question"] = "This meeting has already ended. Did you attend it, miss it, or is no further action needed?"
+            result["reason"] = "The meeting is in the past, but attendance is unknown. Human confirmation is required before any post-meeting reply."
 
         # Deterministic scheduling safety guard. Even if the model prematurely drafts
         # an acceptance, a scheduling message cannot produce a reply until the user

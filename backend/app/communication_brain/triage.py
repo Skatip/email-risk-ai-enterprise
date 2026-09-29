@@ -32,7 +32,6 @@ De-prioritize when no meaningful action/consequence exists:
 Critical distinctions:
 - Recipient ownership matters. If authenticated_account_email is only in CC and not in To, do NOT assume the user owes a reply/follow-up merely because the message contains a request. Only mark reply/action if the message explicitly assigns or directly addresses the authenticated user.
 - Work/project/client/task/strategy correspondence is professional BUSINESS context, not PERSONAL, even when sent from a consumer email domain.
-- A workplace meeting/session with organizer, colleagues/team attendees, project context, or enterprise conferencing evidence is PROFESSIONAL/BUSINESS unless the message contains positive evidence of an actual family/personal relationship. Do not label a work meeting FAMILY/PERSONAL just because a human sent it.
 - A company/job title containing the word 'security' is NOT a security event. security_event=true only for actual account access, authentication, password/MFA changes, suspicious activity, fraud, compromise, or comparable security incidents.
 - gmail.com/outlook.com/yahoo.com does NOT prove family/personal. Infer relationship from the message and conversation evidence.
 - 'job', 'university', 'course', 'recruiting', etc. do NOT automatically make a message important. Distinguish direct communication/application outcome from a bulk feed.
@@ -45,6 +44,8 @@ Assign exactly one product bucket:
 IMPORTANT_NOW, CONVERSATIONAL, BUSINESS, RECRUITING, SECURITY, FOLLOW_UP, TRANSACTIONAL, INFORMATIONAL, JOB_FEED, MARKETING, SOCIAL, AUTOMATED_LOW_VALUE, SPAM.
 IMPORTANT_NOW is reserved for messages with meaningful consequence/action/deadline/security or high-value direct communication.
 Use communication_type CONVERSATIONAL, AUTOMATED, or MIXED.
+Decide `meeting_related` from the complete communication context (including calendar/ICS metadata when present), not keyword matching. Decide `follow_up_needed` only when a real unresolved communication/action remains.
+For `inbox_score`, answer the practical question: how much does this specific message deserve the user's attention now, considering recency, consequence, directness, unresolved action, relationship and current context together. Do not collapse unrelated messages to the same default score.
 Return only the required JSON fields. Keep reason and priority_reason under 180 characters each."""
 
 
@@ -56,7 +57,6 @@ Rules:
 - A company/name containing 'security' is not a security incident unless the event itself concerns account/fraud/security.
 - A consumer email domain does not establish a family/personal relationship.
 - FAMILY/PERSONAL relationship requires positive human-to-human relationship evidence from the message/thread. Automated service, account, billing, security, receipt, notification, or company-to-customer mail is not FAMILY/PERSONAL merely because it is personally relevant to the user.
-- Workplace meetings, practice sessions, interviews, project discussions, and team invitations are PROFESSIONAL/BUSINESS when their context shows work/organization/team participation; never convert them to FAMILY/PERSONAL without positive personal-relationship evidence.
 - Keep relationship separate from importance: an email can be highly consequential to the user while the sender relationship is COMPANY/SERVICE rather than PERSONAL.
 - Distinguish automated application/recruiting status updates from job feeds and from direct recruiter conversations.
 - Distinguish university newsletters from professor/advisor/administrative requests that require action.
@@ -96,11 +96,13 @@ TRIAGE_ITEM_SCHEMA: Dict[str, Any] = {
         "reason": {"type": "string", "maxLength": 220},
         "priority_reason": {"type": "string", "maxLength": 180},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "meeting_related": {"type": "boolean"},
+        "follow_up_needed": {"type": "boolean"},
     },
     "required": [
         "id", "inbox_score", "priority", "label", "bucket", "communication_type", "email_type", "relationship_type", "sender_type",
         "intent", "direct_human", "requires_action", "security_event", "security_reason",
-        "respond_recommended", "reply_decision", "risk", "reason", "priority_reason", "confidence",
+        "respond_recommended", "reply_decision", "risk", "reason", "priority_reason", "confidence", "meeting_related", "follow_up_needed",
     ],
 }
 
@@ -148,6 +150,7 @@ DEEP_SCHEMA: Dict[str, Any] = {
             "required": ["needed", "remind_at_unix", "note", "reason"],
         },
         "commitments": {"type": "array", "items": {"type": "string"}},
+        "meeting_related": {"type": "boolean"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     },
     "required": [
@@ -183,55 +186,24 @@ def _calibrate_priority(value: Any, *, security_event: bool = False, requires_ac
     return round(max(0.05, min(0.94, calibrated)), 3)
 
 def _apply_deterministic_safety(item: Dict[str, Any], message: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach factual/safety evidence without replacing the Brain's semantic judgment."""
     account = str(message.get("authenticated_account_email") or "").strip().lower()
     to_header, cc_header = message.get("to"), message.get("cc")
-    cc_only = bool(account and _address_contains(cc_header, account) and not _address_contains(to_header, account))
-    if cc_only:
-        item["recipient_role"] = "CC"
-        name = str(message.get("authenticated_account_name") or "").strip().lower()
-        body_text = f"{message.get('subject','')} {message.get('snippet','')} {message.get('body','')}".lower()
-        explicitly_addressed = bool(name and len(name) >= 3 and name in body_text)
-        # CC alone never creates reply ownership. Preserve the model's decision only
-        # when the message explicitly addresses the authenticated user by verified name.
-        if not explicitly_addressed:
-            item["respond_recommended"] = False
-            item["reply_decision"] = "NO_REPLY"
-            item["requires_action"] = False
-            if item.get("bucket") == "FOLLOW_UP":
-                item["bucket"] = "BUSINESS" if item.get("communication_type") != "AUTOMATED" else "INFORMATIONAL"
-    elif account and _address_contains(to_header, account):
+    if account and _address_contains(to_header, account):
         item["recipient_role"] = "TO"
+    elif account and _address_contains(cc_header, account):
+        item["recipient_role"] = "CC"
     else:
         item["recipient_role"] = "UNKNOWN"
 
+    # Deterministic secret detection is a safety fact. It may raise risk, but does not
+    # rewrite relationship, intent, category, importance, reply ownership, or Focus.
     text = f"{message.get('subject','')} {message.get('snippet','')} {message.get('body','')}"
     deterministic_risk = compute_risk(str(message.get("subject") or ""), text, str(message.get("from") or ""))
-    if deterministic_risk.risk_score > float(item.get("risk") or 0):
-        item["risk"] = deterministic_risk.risk_score
     if "exposed_secret" in deterministic_risk.signals:
+        item["risk"] = max(float(item.get("risk") or 0), deterministic_risk.risk_score)
         item["security_event"] = True
         item["security_reason"] = "Sensitive credential/API secret detected in message content."
-        item["bucket"] = "SECURITY"
-        item["inbox_score"] = max(float(item.get("inbox_score") or 0), 0.90)
-
-    if item.get("bucket") in {"BUSINESS", "RECRUITING"}:
-        if item.get("sender_type") == "PERSONAL":
-            item["sender_type"] = "COMPANY"
-        if item.get("relationship_type") in {"PERSONAL", "FAMILY", "FAMILY_PERSONAL", "UNKNOWN"}:
-            item["relationship_type"] = "PROFESSIONAL"
-
-    # Semantic consistency guard, not a sender/domain rule: FAMILY/PERSONAL is a
-    # human relationship. Automated/service mail cannot become family/personal
-    # simply because its content is personally consequential to the recipient.
-    relationship = str(item.get("relationship_type") or "UNKNOWN").upper()
-    communication = str(item.get("communication_type") or "").upper()
-    if relationship in {"PERSONAL", "FAMILY", "FAMILY_PERSONAL"} and (
-        not bool(item.get("direct_human")) or communication == "AUTOMATED"
-    ):
-        item["relationship_type"] = "SERVICE" if item.get("sender_type") in {"COMPANY", "AUTOMATED"} else "UNKNOWN"
-
-    item["priority"] = _calibrate_priority(item.get("priority"), security_event=bool(item.get("security_event")), requires_action=bool(item.get("requires_action")))
-    item["label"] = "HIGH" if item["priority"] >= 0.72 else "MEDIUM" if item["priority"] >= 0.40 else "LOW"
     return item
 
 def _normalize_item(raw: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
@@ -268,6 +240,8 @@ def _normalize_item(raw: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, 
         "reason": _clip(raw.get("reason") or "Semantic triage completed.", 220),
         "priority_reason": _clip(raw.get("priority_reason") or raw.get("reason") or "", 220),
         "confidence": _safe_float(raw.get("confidence"), 0.5),
+        "meeting_related": bool(raw.get("meeting_related", False)),
+        "follow_up_needed": bool(raw.get("follow_up_needed", False)),
     }
     return _apply_deterministic_safety(item, fallback)
 
@@ -295,6 +269,8 @@ def _unavailable_item(original: Dict[str, Any]) -> Dict[str, Any]:
         "reason": "Semantic triage was temporarily unavailable; open the email for full analysis.",
         "priority_reason": "Not ranked by fallback keywords.",
         "confidence": 0.0,
+        "meeting_related": False,
+        "follow_up_needed": False,
     }
 
 

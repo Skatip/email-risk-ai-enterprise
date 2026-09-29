@@ -45,7 +45,7 @@ def _refresh_temporal_states(cur, user_id: str, now: int) -> None:
     # A reminder becomes due as soon as its reminder time passes.
     cur.execute(
         """UPDATE followup_reminders SET status='due', triggered_at=COALESCE(triggered_at, ?)
-           WHERE user_id=? AND status IN ('pending','snoozed') AND remind_at <= ?""",
+           WHERE user_id=? AND status IN ('pending','snoozed') AND remind_at > 0 AND remind_at <= ?""",
         (now, user_id, now),
     )
     # A non-meeting deadline becomes missed shortly after its actual event time passes.
@@ -77,17 +77,17 @@ def create_followup(
     if not user_id:
         raise ValueError("user_id is required")
     remind_ts = _safe_int(remind_at)
-    if remind_ts <= 0:
-        raise ValueError("A grounded reminder time is required; Email-AI must not invent a deadline.")
+    kind = str(reminder_kind or "email").lower()
+    if remind_ts <= 0 and kind != "followup":
+        raise ValueError("A grounded reminder time is required for timed reminders; Email-AI must not invent a deadline.")
     event_ts = _safe_int(event_at)
 
     conn = connect(); cur = conn.cursor()
     existing = cur.execute(
         """SELECT * FROM followup_reminders
-           WHERE user_id=? AND email_id=? AND LOWER(COALESCE(reminder_kind,'email'))=LOWER(?)
-             AND status IN ('pending','due','missed','past_unknown','snoozed')
+           WHERE user_id=? AND email_id=? AND status IN ('pending','due','missed','past_unknown','snoozed')
            ORDER BY remind_at ASC LIMIT 1""",
-        (user_id, email_id, reminder_kind or "email"),
+        (user_id, email_id),
     ).fetchone()
     if existing:
         # Correct previously stored guessed times when a grounded event time is now known.

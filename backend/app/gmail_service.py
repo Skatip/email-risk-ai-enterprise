@@ -19,7 +19,7 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googlea
 # User requirement: show Gmail messages from Primary and Spam only, within 1 week.
 # We intentionally do NOT use -unsubscribe or broad sender blocking because that was hiding real emails.
 DAYS_BACK = 7
-PRIMARY_QUERY = f"in:inbox newer_than:{DAYS_BACK}d"
+PRIMARY_QUERY = f"category:primary in:inbox newer_than:{DAYS_BACK}d"
 PRIMARY_FALLBACK_QUERY = f"in:inbox newer_than:{DAYS_BACK}d"
 SPAM_QUERY = f"in:spam newer_than:{DAYS_BACK}d"
 
@@ -299,10 +299,6 @@ def _primary_and_spam_ids(user_query: str = "", scan_limit: int = 80, user_id: s
     # Try true Gmail Primary first.
     ids = _list_message_ids(_append_user_query(PRIMARY_QUERY, user_query), scan_limit, False, user_id)
 
-    # Fallback: some accounts/API responses don't return category:primary reliably.
-    # In fallback, fetch inbox and keep primary-like labels after metadata/body fetch.
-    if not ids:
-        ids = _list_message_ids(_append_user_query(PRIMARY_FALLBACK_QUERY, user_query), scan_limit, False, user_id)
 
     spam_ids = _list_message_ids(_append_user_query(SPAM_QUERY, user_query), scan_limit, True, user_id)
 
@@ -328,8 +324,6 @@ def list_inbox_message_ids(query: str = "", scan_limit: int = 80, user_id: str =
         return [m["id"] for m in (resp.get("messages", []) or [])]
 
     primary = list_ids(_append_user_query(PRIMARY_QUERY, query), False)
-    if not primary:
-        primary = list_ids(_append_user_query(PRIMARY_FALLBACK_QUERY, query), False)
     spam = list_ids(_append_user_query(SPAM_QUERY, query), True)[:min(20, scan_limit)]
     out, seen = [], set()
     for mid in primary + spam:

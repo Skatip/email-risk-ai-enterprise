@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List
 
 from app.db import connect
 
-ANALYSIS_VERSION = __import__('os').getenv('INBOX_ANALYSIS_VERSION', 'semantic-v2')
+ANALYSIS_VERSION = __import__('os').getenv('INBOX_ANALYSIS_VERSION', 'semantic-v3-human-context')
 
 
 def init_inbox_persistence() -> None:
