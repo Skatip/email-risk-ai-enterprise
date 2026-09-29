@@ -816,7 +816,7 @@ export default function EmailCard({ item, onPatchItem, onFollowupCreated, select
                       <div className="attachmentAnalysisHead">
                         <b>{result.document_label || "Document Intelligence"}</b>
                         {result.llm_summary_used ? <span>AI summary</span> : null}
-                        {result.priority_boost ? <span>+{Math.round(Number(result.priority_boost) * 100)} priority</span> : null}
+                        
                       </div>
 
                       {result.title && <div className="attachmentDocTitle">{result.title}</div>}
@@ -988,7 +988,7 @@ export default function EmailCard({ item, onPatchItem, onFollowupCreated, select
                   {attachmentAnalyses.map((a, i) => (
                     <div key={`${a?.filename || i}-panel`} className="attachmentPanelItem">
                       <b>{a?.document_label || "Attachment"}</b> — {a?.filename}
-                      {a?.priority_boost ? <span> • priority boost +{Math.round(Number(a.priority_boost) * 100)}</span> : null}
+                      
                       {a?.llm_summary_used ? <span> • AI summary</span> : null}
                       {a?.title ? <div><b>Title:</b> {a.title}</div> : null}
                       <div>{a?.summary || "No attachment summary available."}</div>

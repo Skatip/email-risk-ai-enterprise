@@ -22,7 +22,7 @@ def _normalize_status(status: Optional[str]) -> Optional[str]:
     if not status:
         return None
     status = status.strip().lower()
-    allowed = {"pending", "due", "missed", "done", "dismissed", "snoozed"}
+    allowed = {"pending", "due", "missed", "past_unknown", "done", "dismissed", "snoozed"}
     return status if status in allowed else None
 
 
@@ -36,7 +36,7 @@ def _refresh_temporal_states(cur, user_id: str, now: int) -> None:
     # post-meeting commitment can still create its own follow-up.
     grace = _missed_grace_seconds()
     cur.execute(
-        """UPDATE followup_reminders SET status='done', completed_at=COALESCE(completed_at, ?)
+        """UPDATE followup_reminders SET status='past_unknown', triggered_at=COALESCE(triggered_at, ?)
            WHERE user_id=? AND status IN ('pending','due','missed','snoozed')
              AND LOWER(COALESCE(reminder_kind,'')) IN ('meeting','calendar','appointment')
              AND COALESCE(event_at,0) > 0 AND event_at + ? < ?""",
@@ -84,7 +84,7 @@ def create_followup(
     conn = connect(); cur = conn.cursor()
     existing = cur.execute(
         """SELECT * FROM followup_reminders
-           WHERE user_id=? AND email_id=? AND status IN ('pending','due','missed','snoozed')
+           WHERE user_id=? AND email_id=? AND status IN ('pending','due','missed','past_unknown','snoozed')
            ORDER BY remind_at ASC LIMIT 1""",
         (user_id, email_id),
     ).fetchone()
@@ -135,7 +135,7 @@ def list_followups(user_id: str, status: Optional[str] = None, limit: int = 100)
     else:
         rows = cur.execute(
             """SELECT * FROM followup_reminders WHERE user_id=?
-               ORDER BY CASE status WHEN 'missed' THEN 0 WHEN 'due' THEN 1 WHEN 'pending' THEN 2 WHEN 'snoozed' THEN 3 WHEN 'done' THEN 4 ELSE 5 END,
+               ORDER BY CASE status WHEN 'missed' THEN 0 WHEN 'past_unknown' THEN 1 WHEN 'due' THEN 2 WHEN 'pending' THEN 3 WHEN 'snoozed' THEN 4 WHEN 'done' THEN 5 ELSE 6 END,
                COALESCE(event_at,remind_at) ASC LIMIT ?""",
             (user_id, limit),
         ).fetchall()
@@ -152,7 +152,7 @@ def list_due_followups(user_id: str, mark_due: bool = True, limit: int = 100) ->
         _refresh_temporal_states(cur, user_id, now); conn.commit()
     rows = cur.execute(
         """SELECT * FROM followup_reminders
-           WHERE user_id=? AND status IN ('due','missed')
+           WHERE user_id=? AND status IN ('due','missed','past_unknown')
            ORDER BY COALESCE(event_at,remind_at) ASC LIMIT ?""",
         (user_id, limit),
     ).fetchall(); conn.close()
@@ -160,7 +160,7 @@ def list_due_followups(user_id: str, mark_due: bool = True, limit: int = 100) ->
 
 
 def update_followup_status(followup_id: Any, status: str, user_id: str) -> Dict[str, Any]:
-    allowed = {"pending", "due", "missed", "done", "dismissed", "snoozed"}
+    allowed = {"pending", "due", "missed", "past_unknown", "done", "dismissed", "snoozed"}
     status = (status or "").strip().lower()
     if status not in allowed:
         raise ValueError(f"status must be one of {sorted(allowed)}")

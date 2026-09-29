@@ -18,11 +18,11 @@ from app.reply_agent import save_rag_example, load_reply_memories
 from app.communication_brain.orchestrator import process_communication
 from app.communication_brain.triage import triage_messages, analyze_message_semantics
 from app.api.google_oauth import router as google_oauth_router
-from app.api.yahoo_oauth import router as yahoo_oauth_router
 from app.api.mcp_tools import router as mcp_tools_router
 from app.integration_store import init_integration_store
 from app.inbox_persistence import (init_inbox_persistence, load_messages, save_metadata, save_semantics, touch_messages, ANALYSIS_VERSION)
 from app.email_rag import init_email_rag, sync_email_rag, rag_status, answer_email_question
+from app.obligation_service import init_obligations, upsert_from_followup
 from app.reply_multi import generate_multi
 from app.learning import record_feedback
 from app.thread_summary_agent import summarize_thread
@@ -50,7 +50,6 @@ except Exception:
 
 app = FastAPI(title="Enterprise Communication Intelligence API", version="2.0.0")
 app.include_router(google_oauth_router)
-app.include_router(yahoo_oauth_router)
 app.include_router(mcp_tools_router)
 
 app.add_middleware(
@@ -132,8 +131,32 @@ async def _persist_grounded_followup(email: Dict[str, Any], semantic: Dict[str, 
         timing["reminder_kind"],
     )
     semantic["grounded_timing"] = timing
+    try:
+        await asyncio.to_thread(upsert_from_followup, user_id, email, timing, semantic, provider)
+    except Exception as obligation_err:
+        print(f"Obligation persistence warning: {obligation_err}")
     return True
 
+
+
+async def _background_enrich_actionable_emails(emails: List[Dict[str, Any]], provider: str, user_id: str) -> None:
+    """Create meeting/deadline intelligence without requiring the user to open the email."""
+    if provider != "gmail" or not user_id:
+        return
+    sem = asyncio.Semaphore(max(1, min(int(os.getenv("BACKGROUND_EMAIL_CONCURRENCY", "3")), 6)))
+    async def one(card: Dict[str, Any]):
+        intent = str(card.get("intent") or "").upper()
+        if not (card.get("requires_action") or card.get("respond_recommended") or any(x in intent for x in ("MEETING","CALENDAR","APPOINTMENT","PAYMENT","DEADLINE"))):
+            return
+        async with sem:
+            try:
+                full = await asyncio.to_thread(fetch_email_body, card.get("id"), user_id)
+                email = {**card, **full}
+                semantic = await asyncio.to_thread(analyze_message_semantics, email, card, thread=[], attachment_context=[])
+                await _persist_grounded_followup(email, semantic, provider, user_id)
+            except Exception as exc:
+                print(f"Background intelligence warning for {card.get('id')}: {exc}")
+    await asyncio.gather(*(one(x) for x in emails), return_exceptions=True)
 
 
 _ANALYZE_CACHE: Dict[str, Any] = {}
@@ -230,6 +253,7 @@ def _startup():
     init_integration_store()
     init_inbox_persistence()
     init_email_rag()
+    init_obligations()
 
 
 @app.get("/inbox")
@@ -256,15 +280,6 @@ async def inbox_fast(
             raise HTTPException(
                 status_code=501,
                 detail="Outlook is intentionally disabled until Microsoft OAuth is configured; app-password login is not supported.",
-            )
-        elif provider == "yahoo":
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Yahoo OAuth is connected, but Yahoo Mail API access uses the restricted mail-r permission. "
-                    "Yahoo must enable Mail API access for this developer application before mailbox reads can be wired. "
-                    "This build intentionally does not use IMAP or app passwords."
-                ),
             )
         else:
             # Latency path: Gmail list is cheap; Neon supplies metadata + semantic
@@ -403,6 +418,10 @@ async def inbox_fast(
 
     out = out[:max_results]
     _cache_set(cache_key, out)
+    try:
+        asyncio.create_task(_background_enrich_actionable_emails(out, provider, user_id))
+    except Exception as bg_err:
+        print(f"Background intelligence scheduling warning: {bg_err}")
     return out
 
 
@@ -456,6 +475,7 @@ async def email_analyze(payload: Dict[str, Any] = Body(...)):
             str(email.get("subject") or ""),
             str(email.get("body") or email.get("snippet") or ""),
             str(email.get("from") or ""),
+            context=semantic,
         )
         item = {
             **email,

@@ -9,9 +9,6 @@ import {
   googleConnectUrl,
   fetchGoogleStatus,
   disconnectGoogle,
-  yahooConnectUrl,
-  fetchYahooStatus,
-  disconnectYahoo,
   fetchRagStatus,
   syncEmailRag,
   askEmailAi,
@@ -32,16 +29,6 @@ const PROVIDERS = [
     enabled: true,
     description:
       "Analyze Gmail inbox with priority, risk, replies, summaries, and reminders.",
-  },
-  {
-    id: "yahoo",
-    name: "Yahoo Mail",
-    logo: "yahoo",
-    email: "",
-    color: "yahoo",
-    enabled: true,
-    description:
-      "Connect securely with Yahoo OAuth. No app password or IMAP login.",
   },
   {
     id: "outlook",
@@ -163,7 +150,6 @@ function MiniBar({ label, value, max }) {
 function LandingPage({
   onChoose,
   onConnectGmail,
-  onConnectYahoo,
   theme,
   toggleTheme,
 }) {
@@ -197,8 +183,6 @@ function LandingPage({
               onClick={() =>
                 p.id === "gmail"
                   ? onConnectGmail()
-                  : p.id === "yahoo"
-                  ? onConnectYahoo()
                   : onChoose(p)
               }
             >
@@ -468,9 +452,8 @@ export default function App() {
     const params = new URLSearchParams(window.location.search);
     const callbackUserId = params.get("user_id");
     const gmailConnected = params.get("gmail") === "connected";
-    const yahooConnected = params.get("yahoo") === "connected";
 
-    if ((gmailConnected || yahooConnected) && callbackUserId) {
+    if (gmailConnected && callbackUserId) {
       localStorage.setItem("email_ai_user_id", callbackUserId);
       return callbackUserId;
     }
@@ -583,25 +566,16 @@ export default function App() {
     window.location.href = googleConnectUrl(freshUserId);
   }
 
-  function beginYahooConnection() {
-    const freshUserId = crypto.randomUUID();
-    localStorage.setItem("email_ai_pending_user_id", freshUserId);
-    window.location.href = yahooConnectUrl(freshUserId);
-  }
-
   async function switchConnectedAccount() {
     setErr("");
     try {
-      if (userId && provider === "yahoo") {
-        await disconnectYahoo(userId);
-      } else if (userId) {
+      if (userId) {
         await disconnectGoogle(userId);
       }
     } catch (e) {
       console.log("Previous mail connection could not be disconnected:", e);
     }
 
-    const previousProvider = provider;
     localStorage.removeItem("email_ai_user_id");
     localStorage.removeItem("email_ai_pending_user_id");
     setItems([]);
@@ -611,11 +585,7 @@ export default function App() {
     setWorkspace(null);
     setUserId("");
 
-    if (previousProvider === "yahoo") {
-      beginYahooConnection();
-    } else {
-      beginGoogleConnection();
-    }
+    beginGoogleConnection();
   }
 
   /*
@@ -658,20 +628,13 @@ export default function App() {
 
       const params = new URLSearchParams(window.location.search);
       const callbackProvider =
-        params.get("yahoo") === "connected"
-          ? "yahoo"
-          : params.get("gmail") === "connected"
-          ? "gmail"
-          : "";
+        params.get("gmail") === "connected" ? "gmail" : "";
 
       try {
         let status = null;
         let restoredProvider = null;
 
-        if (callbackProvider === "yahoo") {
-          status = await fetchYahooStatus(userId);
-          restoredProvider = PROVIDERS.find((p) => p.id === "yahoo");
-        } else if (callbackProvider === "gmail") {
+        if (callbackProvider === "gmail") {
           status = await fetchGoogleStatus(userId);
           restoredProvider = PROVIDERS.find((p) => p.id === "gmail");
         } else {
@@ -679,12 +642,6 @@ export default function App() {
           if (googleStatus?.connected) {
             status = googleStatus;
             restoredProvider = PROVIDERS.find((p) => p.id === "gmail");
-          } else {
-            const yahooStatus = await fetchYahooStatus(userId).catch(() => null);
-            if (yahooStatus?.connected) {
-              status = yahooStatus;
-              restoredProvider = PROVIDERS.find((p) => p.id === "yahoo");
-            }
           }
         }
 
@@ -698,7 +655,6 @@ export default function App() {
 
           if (
             params.has("gmail") ||
-            params.has("yahoo") ||
             params.has("email") ||
             params.has("user_id")
           ) {
@@ -1042,7 +998,6 @@ export default function App() {
       <LandingPage
         onChoose={setWorkspace}
         onConnectGmail={beginGoogleConnection}
-        onConnectYahoo={beginYahooConnection}
         theme={theme}
         toggleTheme={
           toggleTheme

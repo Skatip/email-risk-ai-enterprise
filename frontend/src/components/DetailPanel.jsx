@@ -1,97 +1,31 @@
-function pct(x) {
-  const n = Number(x || 0);
-  return `${Math.round(n * 100)}%`;
-}
-
-function chipTone(label) {
-  const v = String(label || "").toUpperCase();
-  if (v === "HIGH") return "danger";
-  if (v === "MEDIUM") return "warn";
-  return "ok";
-}
-
-function riskTone(x) {
-  const n = Number(x || 0);
-  if (n >= 0.6) return "danger";
-  if (n >= 0.25) return "warn";
-  return "ok";
+function fmtEvent(item) {
+  const t = Number(item?.grounded_timing?.event_at || item?.requested_time?.event_at_unix || 0);
+  return t ? new Date(t * 1000).toLocaleString() : "";
 }
 
 export default function DetailPanel({ item }) {
-  if (!item) {
-    return (
-      <aside className="detailPane">
-        <div className="detailEmpty">
-          <div className="detailEmptyTitle">Select an email</div>
-          <div className="detailEmptySub">
-            The right panel explains priority, risk, trust, suggested reply, and next action.
-          </div>
-        </div>
-      </aside>
-    );
-  }
-
-  const reply = item?.suggested_reply ?? item?.reply?.text ?? item?.reply?.reply ?? item?.reply ?? "";
-  const riskReasons = item?.risk_reasons || item?.human_signals?.risk_reasons || [];
-  const riskSignals = item?.risk_signals || item?.human_signals?.risk_signals || [];
-  const riskUrls = item?.risk_urls || item?.human_signals?.risk_urls || [];
-
+  if (!item) return (
+    <aside className="detailPane"><div className="detailEmpty">
+      <div className="detailEmptyTitle">Select an email</div>
+      <div className="detailEmptySub">Email-AI will show what matters and what you can do next.</div>
+    </div></aside>
+  );
+  const reply=item?.suggested_reply ?? item?.reply?.text ?? item?.reply?.reply ?? item?.reply ?? "";
+  const event=fmtEvent(item);
+  const risks=item?.risk_reasons || item?.human_signals?.risk_reasons || [];
+  const majorRisk=Number(item?.risk||0)>=0.6;
   return (
     <aside className="detailPane">
-      <div className="paneHeader sticky">
-        <div>
-          <div className="paneTitle">AI Analysis</div>
-          <div className="paneSub">Structured explanation for this email</div>
-        </div>
-      </div>
-
+      <div className="paneHeader sticky"><div><div className="paneTitle">Email Intelligence</div><div className="paneSub">What matters and what to do next</div></div></div>
       <div className="detailBody">
-        <div className="detailCard">
-          <div className="detailSubject">{item?.subject || "(no subject)"}</div>
-          <div className="detailFrom">{item?.from || "(no sender)"}</div>
-        </div>
-
-        <div className="metricGrid">
-          <div className={`metricCard ${chipTone(item?.label)}`}><span>Priority</span><b>{pct(item?.priority)}</b></div>
-          <div className={`metricCard ${riskTone(item?.risk)}`}><span>Risk</span><b>{pct(item?.risk)}</b></div>
-          <div className="metricCard"><span>Trust Band</span><b>{item?.sender_band || "UNKNOWN"}</b></div>
-          <div className="metricCard"><span>Intent</span><b>{item?.intent || "Unknown"}</b></div>
-        </div>
-
-        <div className="detailCard">
-          <div className="detailLabel">What this email means</div>
-          <p className="detailText">{item?.reason || "No explanation available yet."}</p>
-        </div>
-
-        <div className="detailCard">
-          <div className="detailLabel">Risk Detection</div>
-          <div className="chipList">
-            {riskSignals.length ? riskSignals.map((x) => <span key={x} className="miniChip">{x}</span>) : <span className="miniChip ok">safe</span>}
-          </div>
-          <ul className="detailList">
-            {riskReasons.length ? riskReasons.map((x, i) => <li key={i}>{x}</li>) : <li>No major phishing or fraud signals detected.</li>}
-          </ul>
-          {riskUrls.length > 0 && (
-            <div className="urlBox">
-              {riskUrls.map((u, i) => <div key={i}><b>{u.host}</b> — {u.finding}</div>)}
-            </div>
-          )}
-        </div>
-
-        <div className="detailCard">
-          <div className="detailLabel">Recommended action</div>
-          <p className="detailText">{item?.respond_recommended ? "Reply is recommended." : "A reply may not be necessary."}</p>
-        </div>
-
-        <div className="detailCard">
-          <div className="detailLabel">Email preview</div>
-          <p className="detailText">{item?.snippet || "No preview available."}</p>
-        </div>
-
-        <div className="detailCard">
-          <div className="detailLabel">Suggested reply</div>
-          <div className="replyPreview">{reply ? reply : "Generate reply to see a suggested draft here."}</div>
-        </div>
+        <div className="detailCard"><div className="detailSubject">{item?.subject||"(no subject)"}</div><div className="detailFrom">{item?.from||"(no sender)"}</div>{event&&<div className="detailText"><b>When:</b> {event}</div>}</div>
+        <div className="detailCard"><div className="detailLabel">What you need to know</div><p className="detailText">{item?.reason||"No explanation available yet."}</p></div>
+        <div className="detailCard"><div className="detailLabel">Recommended action</div><p className="detailText">{item?.respond_recommended?"A response is recommended.":item?.requires_action?"Action is required; a reply may not be necessary.":"No immediate action detected."}</p></div>
+        {majorRisk&&<div className="detailCard"><div className="detailLabel">Security warning</div><ul className="detailList">{risks.slice(0,4).map((x,i)=><li key={i}>{x}</li>)}</ul></div>}
+        {(item?.attachments||[]).length>0&&<details className="detailCard"><summary>Attachments ({item.attachments.length})</summary><div className="detailText">{(item.attachment_analysis||[]).map((a,i)=><div key={i}><b>{a?.document_label||"Attachment"}</b>{a?.summary?` — ${a.summary}`:""}</div>)}</div></details>}
+        <details className="detailCard"><summary>Original email</summary><p className="detailText">{item?.snippet||"No preview available."}</p></details>
+        {reply&&<div className="detailCard"><div className="detailLabel">Suggested reply</div><div className="replyPreview">{reply}</div></div>}
+        <details className="detailCard"><summary>Technical details</summary><div className="detailText">Priority {Math.round(Number(item?.priority||0)*100)}% · Risk {Math.round(Number(item?.risk||0)*100)}% · {item?.intent||"Unknown intent"} · {item?.sender_band||"Unknown sender"}</div></details>
       </div>
     </aside>
   );

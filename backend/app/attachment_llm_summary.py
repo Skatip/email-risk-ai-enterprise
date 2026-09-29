@@ -8,7 +8,7 @@ from app.ai.provider import get_ai_provider
 DOCUMENT_TYPES = [
     "Offer Letter", "Contract", "Invoice", "Resume", "Certificate", "Tax Document",
     "Bank Statement", "Medical Document", "Academic Transcript", "Travel Document",
-    "ID Document", "Spreadsheet", "Image", "Screenshot", "Project Document",
+    "ID Document", "Spreadsheet", "Image", "Screenshot", "Calendar Invitation", "Project Document",
     "Technical Document", "Meeting Notes", "Presentation", "General Document", "Unknown Document",
 ]
 
@@ -184,6 +184,8 @@ def _valid_document_type(value: str, fallback: str = "General Document") -> str:
         return "Travel Document"
     if "resume" in low or low == "cv":
         return "Resume"
+    if "calendar" in low or "meeting" in low or "ics" in low:
+        return "Calendar Invitation"
     if "project" in low or "technical" in low:
         return "Project Document"
     if "screen" in low:
@@ -198,6 +200,8 @@ def _contains_any(text: str, terms: List[str]) -> List[str]:
 
 def _evidence_document_type(filename: str, file_type: str, detected_label: str, text: str, email_subject: str = "") -> Tuple[str, float, List[str]]:
     combined = f"{filename}\n{detected_label}\n{email_subject}\n{text}".lower()
+    if filename.lower().endswith(".ics") or ("begin:vcalendar" in combined and "vevent" in combined):
+        return "Calendar Invitation", 0.99, ["calendar invitation structure"]
     travel_hits = _contains_any(combined, TRAVEL_STRONG_TERMS)
     project_hits = _contains_any(combined, PROJECT_TERMS)
     cert_hits = _contains_any(combined, CERT_TERMS)

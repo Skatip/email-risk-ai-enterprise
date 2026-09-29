@@ -72,7 +72,7 @@ def _brand_impersonation(host: str, sender_domain: str) -> Optional[str]:
     return None
 
 
-def compute_risk(subject: str, body: str, sender: str = "") -> RiskResult:
+def compute_risk(subject: str, body: str, sender: str = "", context: Optional[Dict[str, object]] = None) -> RiskResult:
     text = f"{subject or ''}\n{body or ''}".strip()
     low = text.lower()
     score = 0.0
@@ -81,6 +81,9 @@ def compute_risk(subject: str, body: str, sender: str = "") -> RiskResult:
     urls_out: List[Dict[str, str]] = []
 
     sender_domain = _domain_from_sender(sender)
+    context = context or {}
+    semantic_intent = str(context.get("intent") or "").upper()
+    meeting_context = any(x in semantic_intent for x in ("MEETING", "CALENDAR", "APPOINTMENT", "SCHEDUL"))
     links = _LINK_RE.findall(text)
 
     exposed = [name for name, pattern in _SECRET_PATTERNS if pattern.search(text)]
@@ -114,10 +117,15 @@ def compute_risk(subject: str, body: str, sender: str = "") -> RiskResult:
             finding = "ip_address_link"
 
         if host and sender_domain and _root_domain(host) != _root_domain(sender_domain):
-            score += 0.10
-            signals.append("domain_mismatch")
-            reasons.append(f"Link domain does not match sender domain: {host}")
-            finding = "domain_mismatch"
+            # Third-party links are weak evidence. For a semantically confirmed meeting,
+            # an external conferencing host is expected and should not inflate phishing risk.
+            if not meeting_context:
+                score += 0.04
+                signals.append("external_link_domain")
+                reasons.append(f"Email links to an external domain: {host}")
+                finding = "external_domain"
+            else:
+                finding = "expected_external_service"
 
         tld = host.split(".")[-1] if "." in host else ""
         if tld in _SUSPICIOUS_TLDS:
