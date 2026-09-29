@@ -91,3 +91,20 @@ def touch_messages(user_id: str, email_ids: Iterable[str], provider: str = 'gmai
     cur.execute(f'UPDATE inbox_messages SET last_seen_at=? WHERE user_id=? AND provider=? AND email_id IN ({placeholders})',
                 (now, user_id, provider, *ids))
     conn.commit(); conn.close()
+
+
+def load_recent_messages(user_id: str, provider: str = 'gmail', limit: int = 200) -> List[Dict[str, Any]]:
+    """Return persisted metadata + semantics newest-first for reconciliation jobs."""
+    if not user_id:
+        return []
+    conn = connect(); cur = conn.cursor()
+    rows = cur.execute('''SELECT email_id, metadata_json, semantic_json, analysis_version, message_ts
+                          FROM inbox_messages WHERE user_id=? AND provider=?
+                          ORDER BY message_ts DESC LIMIT ?''',
+                       (user_id, provider, max(1, min(int(limit), 500)))).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        meta = _obj(r.get('metadata_json')); sem = _obj(r.get('semantic_json'))
+        out.append({**meta, '_semantic': sem, '_analysis_version': r.get('analysis_version') or ''})
+    return out

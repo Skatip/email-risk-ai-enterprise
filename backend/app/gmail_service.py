@@ -19,7 +19,7 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googlea
 # User requirement: show Gmail messages from Primary and Spam only, within 1 week.
 # We intentionally do NOT use -unsubscribe or broad sender blocking because that was hiding real emails.
 DAYS_BACK = 7
-PRIMARY_QUERY = f"in:inbox category:primary newer_than:{DAYS_BACK}d"
+PRIMARY_QUERY = f"in:inbox newer_than:{DAYS_BACK}d"
 PRIMARY_FALLBACK_QUERY = f"in:inbox newer_than:{DAYS_BACK}d"
 SPAM_QUERY = f"in:spam newer_than:{DAYS_BACK}d"
 
@@ -178,8 +178,7 @@ def _is_primary_like(label_ids: List[str]) -> bool:
         return True
     if "INBOX" not in labels:
         return False
-    if labels.intersection(NOISE_CATEGORY_LABELS):
-        return False
+    # Do not hide Gmail category tabs here. Focus/importance is a semantic decision.
     return True
 
 
@@ -331,7 +330,7 @@ def list_inbox_message_ids(query: str = "", scan_limit: int = 80, user_id: str =
     primary = list_ids(_append_user_query(PRIMARY_QUERY, query), False)
     if not primary:
         primary = list_ids(_append_user_query(PRIMARY_FALLBACK_QUERY, query), False)
-    spam = list_ids(_append_user_query(SPAM_QUERY, query), True)
+    spam = list_ids(_append_user_query(SPAM_QUERY, query), True)[:min(20, scan_limit)]
     out, seen = [], set()
     for mid in primary + spam:
         if mid not in seen:

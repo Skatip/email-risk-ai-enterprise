@@ -13,14 +13,14 @@ from app.db import init_db, kv_get, kv_set
 from app.gmail_service import (fetch_full_thread, fetch_inbox_fast, fetch_email_body, fetch_gmail_attachment, create_reply_draft,
     list_inbox_message_ids, fetch_message_metadata_batch)
 from app.calendar_service import free_busy
-from app.time_grounding import extract_requested_time
+from app.time_grounding import extract_requested_time, extract_ics_time
 from app.reply_agent import save_rag_example, load_reply_memories
 from app.communication_brain.orchestrator import process_communication
 from app.communication_brain.triage import triage_messages, analyze_message_semantics
 from app.api.google_oauth import router as google_oauth_router
 from app.api.mcp_tools import router as mcp_tools_router
 from app.integration_store import init_integration_store
-from app.inbox_persistence import (init_inbox_persistence, load_messages, save_metadata, save_semantics, touch_messages, ANALYSIS_VERSION)
+from app.inbox_persistence import (init_inbox_persistence, load_messages, save_metadata, save_semantics, touch_messages, load_recent_messages, ANALYSIS_VERSION)
 from app.email_rag import init_email_rag, sync_email_rag, rag_status, answer_email_question
 from app.obligation_service import init_obligations, upsert_from_followup, query_obligations
 from app.reply_multi import generate_multi
@@ -187,7 +187,7 @@ async def _background_enrich_actionable_emails(emails: List[Dict[str, Any]], pro
 
 _ANALYZE_CACHE: Dict[str, Any] = {}
 _ANALYZE_CACHE_LOCK = threading.Lock()
-_ANALYZE_CACHE_TTL = int(os.getenv("INBOX_CACHE_TTL_SECONDS", "90"))
+_ANALYZE_CACHE_TTL = int(os.getenv("INBOX_CACHE_TTL_SECONDS", "8"))
 
 
 def _cache_get(key: str):
@@ -311,7 +311,7 @@ async def inbox_fast(
             # Latency path: Gmail list is cheap; Neon supplies metadata + semantic
             # intelligence for messages we have already processed. Only genuinely new
             # Gmail IDs require metadata fetch + Communication Brain work.
-            scan_limit = max(max_results * 6, 72)
+            scan_limit = min(200, max(max_results * 5, 80))
             discovered_ids = await asyncio.to_thread(
                 list_inbox_message_ids, _effective_query(query), scan_limit, user_id
             )
@@ -435,6 +435,9 @@ async def inbox_fast(
 
     if requested_bucket in {"FOCUS", "IMPORTANT"}:
         out = [x for x in out if x.get("bucket") in important_buckets and (float(x.get("inbox_score", 0)) >= threshold or x.get("requires_action") or x.get("direct_human") or x.get("security_event"))]
+        # Focus means the newest N messages that qualify as important, matching the
+        # user's Gmail chronology. Old 94% alerts must not crowd out newer important mail.
+        out.sort(key=lambda x: int(x.get("ts", 0)), reverse=True)
     elif requested_bucket == "NEEDS_REPLY":
         out = [x for x in out if x.get("respond_recommended") or str(x.get("reply_decision") or "").upper() == "DRAFT_REPLY"]
     elif requested_bucket == "PEOPLE":
@@ -457,13 +460,85 @@ async def inbox_fast(
     return out
 
 
+async def _reconcile_cached_meetings(user_id: str, limit: int = 180) -> None:
+    """Repair the meeting registry from already-cached Gmail evidence.
+
+    This runs only for the Meetings surface/low-priority background work. It does not
+    block the inbox. Meeting candidates come from semantic intent or calendar evidence,
+    not company-specific sender rules.
+    """
+    rows = await asyncio.to_thread(load_recent_messages, user_id, "gmail", limit)
+    for card in rows:
+        sem = card.get("_semantic") or {}
+        intent = str(sem.get("intent") or "").upper()
+        attachments = card.get("attachments") or []
+        has_ics = any(str(a.get("filename") or "").lower().endswith(".ics") or "text/calendar" in str(a.get("mimeType") or a.get("mime_type") or "").lower() for a in attachments)
+        semantic_meeting = any(x in intent for x in ("MEETING", "CALENDAR", "APPOINTMENT", "SCHEDULE", "INVITE"))
+        if not (has_ics or semantic_meeting):
+            continue
+        timing = extract_requested_time(card)
+        # ICS is authoritative when available. Fetch only tiny calendar attachments,
+        # never all attachments and never all message bodies.
+        if has_ics:
+            for att in attachments:
+                if not (str(att.get("filename") or "").lower().endswith(".ics") or "text/calendar" in str(att.get("mimeType") or att.get("mime_type") or "").lower()):
+                    continue
+                aid = att.get("attachmentId") or att.get("attachment_id")
+                if not aid:
+                    continue
+                try:
+                    data = await asyncio.to_thread(fetch_gmail_attachment, str(card.get("id")), str(aid), user_id)
+                    timing = extract_ics_time(data) or timing
+                except Exception as exc:
+                    print(f"ICS meeting reconciliation warning for {card.get('id')}: {exc}")
+                if timing:
+                    break
+        if not timing and semantic_meeting:
+            try:
+                full = await asyncio.to_thread(fetch_email_body, card.get("id"), user_id)
+                timing = extract_requested_time({**card, **full})
+            except Exception:
+                timing = None
+        if not timing or int(timing.get("event_at_unix") or 0) <= 0:
+            continue
+        normalized = {**sem, "intent": intent or "MEETING_REQUEST"}
+        grounded = {
+            "event_at": int(timing["event_at_unix"]),
+            "remind_at": max(1, int(timing["event_at_unix"]) - max(0, min(int(os.getenv("MEETING_REMINDER_LEAD_SECONDS", "900")), 86400))),
+            "event_timezone": timing.get("timezone") or "",
+            "reminder_kind": "meeting",
+            "requested_time": timing,
+        }
+        await asyncio.to_thread(upsert_from_followup, user_id, card, grounded, normalized, "gmail")
+        # Keep reminder separate from meeting registry.
+        try:
+            await asyncio.to_thread(create_followup, card.get("id", ""), grounded["remind_at"], f"Reminder for {card.get('subject') or 'meeting'}", card.get("threadId", ""), card.get("subject", ""), card.get("from", ""), "gmail", user_id, grounded["event_at"], grounded["event_timezone"], "meeting")
+        except Exception as exc:
+            print(f"Meeting reminder reconciliation warning for {card.get('id')}: {exc}")
+
+
 @app.get("/meetings")
-async def meetings(user_id: str = Query(default=""), limit: int = Query(default=100)):
+async def meetings(user_id: str = Query(default=""), limit: int = Query(default=100), refresh: bool = Query(default=True)):
     """Persistent meeting registry, independent from inbox pagination and follow-ups."""
     if not user_id:
         return []
+    if refresh:
+        try:
+            await _reconcile_cached_meetings(user_id)
+        except Exception as exc:
+            print(f"Meeting registry reconciliation warning: {exc}")
     rows = await asyncio.to_thread(query_obligations, user_id, limit)
-    return [r for r in rows if str(r.get("kind") or "").lower() in {"meeting", "calendar", "appointment"}]
+    meetings_only = [r for r in rows if str(r.get("kind") or "").lower() in {"meeting", "calendar", "appointment"}]
+    # Multiple invitation/update emails can refer to one event. Show the event once.
+    deduped, seen = [], set()
+    for row in meetings_only:
+        title_key = " ".join(str(row.get("title") or "").lower().split())
+        sender_key = str(row.get("source_sender") or "").lower().strip()
+        key = (int(row.get("due_at") or 0), title_key, sender_key)
+        if key in seen:
+            continue
+        seen.add(key); deduped.append(row)
+    return deduped[:limit]
 
 
 @app.post("/email/analyze")

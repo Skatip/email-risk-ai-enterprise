@@ -748,16 +748,9 @@ export default function App() {
             null
       );
 
-      // Fast path ends here. Full body/thread/OCR analysis is intentionally lazy:
-      // it runs only when the user opens a message or requests a reply/action.
-      // Keep Ask Email-AI current without blocking inbox rendering. Existing RAG
-      // documents are skipped server-side, so this normally indexes only new mail.
-      window.setTimeout(() => {
-        syncEmailRag({ userId, maxMessages: 100, query: "in:anywhere" })
-          .then(() => fetchRagStatus(userId))
-          .then((status) => setRagStatus(status))
-          .catch((ragErr) => console.debug("Background RAG sync skipped:", ragErr));
-      }, 1500);
+      // Inbox rendering ends here. Do not start mailbox-wide RAG or meeting
+      // reconciliation on this critical path. Ask Email-AI has an explicit history sync,
+      // and Meetings reconciles when that surface is opened.
     } catch (e) {
       setErr(
         String(
@@ -847,7 +840,8 @@ export default function App() {
       loadInbox();
       loadAnalytics();
       loadFollowups();
-      loadMeetings();
+      // Meetings are reconciled lazily when the Meetings tab is opened. This keeps
+      // Gmail/ICS work off the inbox startup path.
     }
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
