@@ -5,6 +5,7 @@ import {
   fetchAnalytics,
   fetchDueFollowups,
   fetchFollowups,
+  fetchMeetings,
   updateFollowupStatus,
   googleConnectUrl,
   fetchGoogleStatus,
@@ -367,6 +368,31 @@ function AnalyticsPanel({
   );
 }
 
+function MeetingsPanel({ meetings, onRefresh }) {
+  const now = Date.now() / 1000;
+  return (
+    <div className="panelCard full">
+      <div className="panelHeader">
+        <div><h3>Meetings</h3><p>Scheduled meetings stay here independently of inbox filters and follow-ups.</p></div>
+        <button className="softBtn" onClick={onRefresh}>Refresh meetings</button>
+      </div>
+      {meetings.length === 0 && <div className="emptyState">No meetings detected yet.</div>}
+      {meetings.map((m) => {
+        const past = Number(m.due_at || 0) > 0 && Number(m.due_at) < now;
+        return (
+          <div key={`${m.email_id}-${m.kind}`} className={`followupRow ${past ? "past_unknown" : "pending"}`}>
+            <div>
+              <b>{m.title || "Meeting"}</b>
+              <p>{past ? "Meeting ended · attendance unknown" : "Scheduled meeting"}</p>
+              <small>{m.source_sender || "email"} • {fmtTime(m.due_at)}{m.timezone ? ` • ${m.timezone}` : ""}</small>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function FollowupPanel({
   followups,
   onDone,
@@ -377,12 +403,11 @@ function FollowupPanel({
       <div className="panelHeader">
         <div>
           <h3>
-            Follow-up & Reminder Dashboard
+            Follow-ups
           </h3>
 
           <p>
-            Pending and due reminders from your
-            emails.
+            Unresolved actions that still need your attention.
           </p>
         </div>
 
@@ -390,13 +415,13 @@ function FollowupPanel({
           className="softBtn"
           onClick={onRefresh}
         >
-          Refresh reminders
+          Refresh follow-ups
         </button>
       </div>
 
       {followups.length === 0 && (
         <div className="emptyState">
-          No reminders yet.
+          No follow-ups right now.
         </div>
       )}
 
@@ -554,6 +579,9 @@ export default function App() {
     setFollowups,
   ] = useState([]);
 
+  const [meetings, setMeetings] = useState([]);
+  const [reminders, setReminders] = useState([]);
+
   const provider =
     workspace?.id || "gmail";
 
@@ -582,6 +610,8 @@ export default function App() {
     setSelectedId(null);
     setAnalytics(null);
     setFollowups([]);
+    setMeetings([]);
+    setReminders([]);
     setWorkspace(null);
     setUserId("");
 
@@ -789,16 +819,22 @@ export default function App() {
   async function loadFollowups() {
     try {
       await fetchDueFollowups(userId);
-
-      setFollowups(
-        await fetchFollowups("", userId)
-      );
+      const rows = await fetchFollowups("", userId);
+      setReminders(rows || []);
+      // New canonical follow-ups are explicitly typed. Legacy generic `email`
+      // reminders are intentionally not shown as follow-ups because they may have
+      // been created by the old one-hour/default-reminder behavior.
+      setFollowups((rows || []).filter((f) => String(f?.reminder_kind || "").toLowerCase() === "followup"));
     } catch (e) {
-      setErr(
-        String(
-          e?.message || e
-        )
-      );
+      setErr(String(e?.message || e));
+    }
+  }
+
+  async function loadMeetings() {
+    try {
+      setMeetings(await fetchMeetings(userId, 100));
+    } catch (e) {
+      setErr(String(e?.message || e));
     }
   }
 
@@ -811,6 +847,7 @@ export default function App() {
       loadInbox();
       loadAnalytics();
       loadFollowups();
+      loadMeetings();
     }
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -928,7 +965,7 @@ export default function App() {
     );
 
   const activeReminder = useMemo(() => {
-    const live = (followups || []).filter((f) => !["done", "dismissed"].includes(String(f?.status || "").toLowerCase()));
+    const live = (reminders || []).filter((f) => !["done", "dismissed"].includes(String(f?.status || "").toLowerCase()));
     const missed = live.find((f) => String(f?.status || "").toLowerCase() === "missed");
     if (missed) return { ...missed, ui_state: "missed" };
     const due = live.find((f) => String(f?.status || "").toLowerCase() === "due");
@@ -941,7 +978,7 @@ export default function App() {
       return { ...upcoming, ui_state: "upcoming" };
     }
     return null;
-  }, [followups]);
+  }, [reminders]);
 
   const counts = useMemo(() => {
     const high =
@@ -1094,6 +1131,13 @@ export default function App() {
           }
         >
           Inbox
+        </button>
+
+        <button
+          className={tab === "meetings" ? "active" : ""}
+          onClick={() => { setTab("meetings"); loadMeetings(); }}
+        >
+          Meetings
         </button>
 
         <button
@@ -1300,6 +1344,12 @@ export default function App() {
             />
           </main>
         </>
+      )}
+
+      {tab === "meetings" && (
+        <main className="pagePanel">
+          <MeetingsPanel meetings={meetings} onRefresh={loadMeetings} />
+        </main>
       )}
 
       {tab === "followups" && (

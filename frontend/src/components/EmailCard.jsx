@@ -131,7 +131,7 @@ function senderTypeIcon(type) {
 function shouldOfferReply(item) {
   const decision = String(item?.reply_decision || item?.decision || "").toUpperCase();
   if (["DRAFT_REPLY", "DRAFT_AND_ACTION"].includes(decision)) return true;
-  if (["NO_REPLY", "ASK_USER", "ACTION_ONLY", "WAIT"].includes(decision)) return false;
+  if (["NO_REPLY", "ASK_USER", "ACTION_ONLY", "WAIT", "PAST_EVENT"].includes(decision)) return false;
   return item?.respond_recommended === true;
 }
 
@@ -139,7 +139,8 @@ function replyButtonLabel(item, loadingDraft, hasDraft) {
   if (loadingDraft) return "Understanding...";
   const isFinal = item?.analysis_status === "done";
   const decision = String(item?.reply_decision || item?.decision || "").toUpperCase();
-  if (!isFinal && ["NO_REPLY", "ASK_USER", "ACTION_ONLY", "WAIT"].includes(decision)) return "Check reply";
+  if (!isFinal && ["NO_REPLY", "ASK_USER", "ACTION_ONLY", "WAIT", "PAST_EVENT"].includes(decision)) return "Check reply";
+  if (decision === "PAST_EVENT") return "Meeting ended";
   if (decision === "ASK_USER") return "Needs your input";
   if (decision === "ACTION_ONLY") return "Action only";
   if (decision === "WAIT") return "Wait / no reply";
@@ -154,6 +155,7 @@ function noReplyReason(item) {
   }
   if (decision === "ACTION_ONLY") return item?.reason || "The message requires an action rather than an email reply.";
   if (decision === "WAIT") return item?.reason || "The conversation should wait for now.";
+  if (decision === "PAST_EVENT") return item?.clarification_question || "This meeting has already ended. Attendance is unknown.";
   return item?.reason || item?.priority_reason || "AI determined that a reply is not necessary.";
 }
 
@@ -249,6 +251,9 @@ function shortFileName(name, n = 36) {
 }
 
 function attachmentDocLabel(att, result) {
+  const name = String(result?.filename || att?.filename || "").toLowerCase();
+  const dtype = String(result?.document_type || att?.document_type || "").toLowerCase();
+  if (name.endsWith(".ics") || dtype.includes("calendar") || dtype.includes("meeting_invite")) return "Calendar invitation";
   return result?.document_label || att?.document_label || String(att?.file_type || "file").toUpperCase();
 }
 
@@ -814,7 +819,7 @@ export default function EmailCard({ item, onPatchItem, onFollowupCreated, select
                   {result && (
                     <div className={`attachmentAnalysis ${result.risk_level || "low"}`}>
                       <div className="attachmentAnalysisHead">
-                        <b>{result.document_label || "Document Intelligence"}</b>
+                        <b>{attachmentDocLabel(att, result) || "Document Intelligence"}</b>
                         {result.llm_summary_used ? <span>AI summary</span> : null}
                         
                       </div>
@@ -987,7 +992,7 @@ export default function EmailCard({ item, onPatchItem, onFollowupCreated, select
                 <div className="reasonText attachmentPanelText">
                   {attachmentAnalyses.map((a, i) => (
                     <div key={`${a?.filename || i}-panel`} className="attachmentPanelItem">
-                      <b>{a?.document_label || "Attachment"}</b> — {a?.filename}
+                      <b>{attachmentDocLabel(a, a) || "Attachment"}</b> — {a?.filename}
                       
                       {a?.llm_summary_used ? <span> • AI summary</span> : null}
                       {a?.title ? <div><b>Title:</b> {a.title}</div> : null}

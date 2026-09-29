@@ -78,7 +78,7 @@ def create_followup(
         raise ValueError("user_id is required")
     remind_ts = _safe_int(remind_at)
     if remind_ts <= 0:
-        remind_ts = _now() + 3600
+        raise ValueError("A grounded reminder time is required; Email-AI must not invent a deadline.")
     event_ts = _safe_int(event_at)
 
     conn = connect(); cur = conn.cursor()

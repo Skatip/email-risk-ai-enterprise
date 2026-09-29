@@ -22,7 +22,7 @@ from app.api.mcp_tools import router as mcp_tools_router
 from app.integration_store import init_integration_store
 from app.inbox_persistence import (init_inbox_persistence, load_messages, save_metadata, save_semantics, touch_messages, ANALYSIS_VERSION)
 from app.email_rag import init_email_rag, sync_email_rag, rag_status, answer_email_question
-from app.obligation_service import init_obligations, upsert_from_followup
+from app.obligation_service import init_obligations, upsert_from_followup, query_obligations
 from app.reply_multi import generate_multi
 from app.learning import record_feedback
 from app.thread_summary_agent import summarize_thread
@@ -109,32 +109,52 @@ def _ground_followup_time(email: Dict[str, Any], follow: Dict[str, Any], schedul
 
 
 async def _persist_grounded_followup(email: Dict[str, Any], semantic: Dict[str, Any], provider: str, user_id: str) -> bool:
-    follow = semantic.get("follow_up") or {}
-    if not user_id or not follow.get("needed"):
+    """Persist three separate concepts correctly: meeting registry, reminder, follow-up.
+
+    Meetings may create a timed reminder even when no conversational follow-up is
+    required. Non-meeting follow-ups require explicit semantic evidence AND a
+    grounded time; no synthetic now+1h deadlines are allowed.
+    """
+    if not user_id:
         return False
+    follow = semantic.get("follow_up") or {}
     scheduling = _is_scheduling_request(email, semantic)
     timing = _ground_followup_time(email, follow, scheduling=scheduling)
+
+    # Security/authentication notices are alerts, not overdue commitments by
+    # default. They remain visible through Security/Inbox intelligence.
+    intent = str(semantic.get("intent") or "").upper()
+    security_only = bool(semantic.get("security_event")) and not any(x in intent for x in ("PAYMENT", "DEADLINE", "MEETING", "CALENDAR", "APPOINTMENT"))
+
+    if scheduling and int(timing.get("event_at") or 0) > 0:
+        # Persist canonical meeting lifecycle independently from Follow-ups.
+        await asyncio.to_thread(upsert_from_followup, user_id, email, timing, semantic, provider)
+        # A meeting reminder is a reminder, not a Follow-up; it is stored in the
+        # reminder table but filtered from the Follow-ups UI.
+        await asyncio.to_thread(
+            create_followup, email.get("id", ""), timing["remind_at"],
+            follow.get("note") or f"Reminder for {email.get('subject') or 'meeting'}",
+            email.get("threadId", ""), email.get("subject", ""), email.get("from", ""),
+            provider, user_id, timing["event_at"], timing["event_timezone"], "meeting",
+        )
+        semantic["grounded_timing"] = timing
+        return True
+
+    if security_only or not follow.get("needed"):
+        return False
     if int(timing.get("remind_at") or 0) <= 0:
         return False
+
+    # Non-meeting actions need a genuinely grounded deadline/reminder.
     await asyncio.to_thread(
-        create_followup,
-        email.get("id", ""),
-        timing["remind_at"],
+        create_followup, email.get("id", ""), timing["remind_at"],
         follow.get("note") or follow.get("reason") or "Follow up on this email",
-        email.get("threadId", ""),
-        email.get("subject", ""),
-        email.get("from", ""),
-        provider,
-        user_id,
-        timing["event_at"],
-        timing["event_timezone"],
-        timing["reminder_kind"],
+        email.get("threadId", ""), email.get("subject", ""), email.get("from", ""),
+        provider, user_id, timing["event_at"], timing["event_timezone"], "followup",
     )
+    timing["reminder_kind"] = "followup"
     semantic["grounded_timing"] = timing
-    try:
-        await asyncio.to_thread(upsert_from_followup, user_id, email, timing, semantic, provider)
-    except Exception as obligation_err:
-        print(f"Obligation persistence warning: {obligation_err}")
+    await asyncio.to_thread(upsert_from_followup, user_id, email, timing, semantic, provider)
     return True
 
 
@@ -289,8 +309,9 @@ async def inbox_fast(
             discovered_ids = await asyncio.to_thread(
                 list_inbox_message_ids, _effective_query(query), scan_limit, user_id
             )
-            # Keep a bounded candidate window, matching the previous endpoint behavior.
-            discovered_ids = discovered_ids[:max(max_results * 3, 36)]
+            # Keep the full bounded scan window. Filtering happens after semantic triage,
+            # so truncating before the requested bucket was the reason selecting 50
+            # could return only ~30 Focus messages even when more matches existed.
             persisted = await asyncio.to_thread(load_messages, user_id, discovered_ids, "gmail")
             missing_ids = [mid for mid in discovered_ids if mid not in persisted or not persisted[mid].get("metadata")]
             fresh = []
@@ -397,6 +418,11 @@ async def inbox_fast(
     else:
         out.sort(key=lambda x: int(x.get("ts", 0)), reverse=True)
 
+    # Preserve the complete analyzed candidate set for background meeting/deadline
+    # discovery. A meeting must not disappear from the Meetings registry merely
+    # because the user is currently viewing another inbox bucket.
+    background_candidates = list(out)
+
     requested_bucket = (bucket or "FOCUS").upper()
     important_buckets = {"IMPORTANT_NOW", "CONVERSATIONAL", "BUSINESS", "RECRUITING", "SECURITY", "FOLLOW_UP", "TRANSACTIONAL"}
     threshold = float(os.getenv("IMPORTANT_INBOX_MIN_SCORE", "0.38"))
@@ -419,10 +445,19 @@ async def inbox_fast(
     out = out[:max_results]
     _cache_set(cache_key, out)
     try:
-        asyncio.create_task(_background_enrich_actionable_emails(out, provider, user_id))
+        asyncio.create_task(_background_enrich_actionable_emails(background_candidates, provider, user_id))
     except Exception as bg_err:
         print(f"Background intelligence scheduling warning: {bg_err}")
     return out
+
+
+@app.get("/meetings")
+async def meetings(user_id: str = Query(default=""), limit: int = Query(default=100)):
+    """Persistent meeting registry, independent from inbox pagination and follow-ups."""
+    if not user_id:
+        return []
+    rows = await asyncio.to_thread(query_obligations, user_id, limit)
+    return [r for r in rows if str(r.get("kind") or "").lower() in {"meeting", "calendar", "appointment"}]
 
 
 @app.post("/email/analyze")
@@ -621,6 +656,22 @@ async def reply_generate(payload: Dict[str, Any] = Body(...)):
             user_preferences=user_preferences,
         )
 
+        # Temporal reply guard: never draft future-attendance language for a meeting
+        # whose grounded event time has already passed. The user may later choose a
+        # specific post-meeting action (e.g. apologize/reschedule), but the default
+        # reply path must not claim they will attend a past event.
+        scheduling = _is_scheduling_request(email, {**analysis, **result})
+        grounded_for_reply = extract_requested_time(email) if scheduling else None
+        grounded_event_at = int((grounded_for_reply or {}).get("event_at_unix") or 0)
+        if scheduling and grounded_event_at and grounded_event_at < int(time.time()):
+            result["decision"] = "PAST_EVENT"
+            result["reply"] = ""
+            result["should_reply"] = False
+            result["respond_recommended"] = False
+            result["needs_user_input"] = False
+            result["event_lifecycle"] = "past_unknown"
+            result["clarification_question"] = "This meeting has already ended. Attendance is unknown; choose a post-meeting action before drafting a reply."
+
         # Deterministic scheduling safety guard. Even if the model prematurely drafts
         # an acceptance, a scheduling message cannot produce a reply until the user
         # explicitly confirms availability. We ground the requested time from the
@@ -628,7 +679,7 @@ async def reply_generate(payload: Dict[str, Any] = Body(...)):
         availability_confirmation = str(user_preferences.get("availability_confirmation") or "").strip().lower()
         scheduling = _is_scheduling_request(email, {**analysis, **result})
         grounded_request = extract_requested_time(email) if scheduling else None
-        if scheduling and not availability_confirmation and grounded_request:
+        if scheduling and not availability_confirmation and grounded_request and int(grounded_request.get("event_at_unix") or 0) >= int(time.time()):
             result["decision"] = "CHECK_CALENDAR"
             result["reply"] = ""
             result["should_reply"] = False

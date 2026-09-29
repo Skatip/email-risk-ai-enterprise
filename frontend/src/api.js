@@ -113,6 +113,11 @@ export async function createFollowup(payload) {
   return await handle(res);
 }
 
+export async function fetchMeetings(userId = "", limit = 100) {
+  const res = await fetch(`${API_BASE}/meetings?user_id=${encodeURIComponent(userId)}&limit=${encodeURIComponent(limit)}`);
+  return await handle(res);
+}
+
 export async function fetchFollowups(status = "", userId = "") {
   const res = await fetch(`${API_BASE}/followups?status=${encodeURIComponent(status)}&user_id=${encodeURIComponent(userId)}`);
   return await handle(res);
