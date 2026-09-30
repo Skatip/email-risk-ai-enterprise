@@ -362,14 +362,10 @@ export default function EmailCard({ item, onPatchItem, onFollowupCreated, select
 
       const existing = Array.isArray(item?.attachment_analysis) ? item.attachment_analysis : [];
       const nextAnalysis = [...existing.filter((x) => x?.filename !== res?.filename), res];
-      const boost = Math.max(Number(item?.attachment_priority_boost || 0), Number(res?.priority_boost || 0));
-      const basePriority = Number(item?.priority || 0);
-      const patchedPriority = Math.min(1, basePriority + boost);
-
+      // Attachment analysis may add evidence, but it must not numerically mutate the
+      // Communication Brain's message priority. Priority has one semantic authority.
       onPatchItem?.({
         attachment_analysis: nextAnalysis,
-        attachment_priority_boost: boost,
-        priority: patchedPriority,
         attachment_reply_context: nextAnalysis.map((x) => x?.reply_context).filter(Boolean).join("\n"),
       });
     } catch (e) {
@@ -408,13 +404,10 @@ export default function EmailCard({ item, onPatchItem, onFollowupCreated, select
         byKey[key] = r;
       }
       setAttachmentResults((prev) => ({ ...prev, ...byKey }));
-      const boost = analyses.reduce((m, x) => Math.max(m, Number(x?.priority_boost || 0)), 0);
       onPatchItem?.({
         attachment_analysis: analyses,
         attachment_bundle: res?.attachment_bundle || {},
         attachment_reply_context: res?.attachment_reply_context || res?.attachment_bundle?.reply_context || "",
-        attachment_priority_boost: boost,
-        priority: Math.min(1, Number(item?.priority || 0) + boost),
       });
     } catch (e) {
       setErr(String(e?.message || e));

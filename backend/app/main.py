@@ -114,6 +114,37 @@ def _ground_followup_time(email: Dict[str, Any], follow: Dict[str, Any], schedul
     }
 
 
+async def _ground_calendar_time_for_reply(email: Dict[str, Any], user_id: str) -> Dict[str, Any] | None:
+    """Use factual ICS timing for reply lifecycle when a calendar invite is present.
+
+    This prevents stale attachment prose or subject/body time parsing from treating
+    an ended calendar event as upcoming. It does not infer meeting meaning.
+    """
+    for att in (email.get("attachments") or []):
+        filename = str(att.get("filename") or "").lower()
+        mime = str(att.get("mimeType") or att.get("mime_type") or "").lower()
+        if not (filename.endswith(".ics") or "text/calendar" in mime):
+            continue
+        data = b""
+        inline = str(att.get("inline_data") or "")
+        if inline:
+            try:
+                data = base64.urlsafe_b64decode(inline + "=" * (-len(inline) % 4))
+            except Exception:
+                data = b""
+        if not data and user_id:
+            aid = att.get("attachmentId") or att.get("attachment_id")
+            if aid:
+                try:
+                    data = await asyncio.to_thread(fetch_gmail_attachment, str(email.get("id")), str(aid), user_id)
+                except Exception as exc:
+                    print(f"Calendar reply grounding warning for {email.get('id')}: {exc}")
+        parsed = extract_ics_time(data) if data else None
+        if parsed:
+            return parsed
+    return None
+
+
 async def _persist_grounded_followup(email: Dict[str, Any], semantic: Dict[str, Any], provider: str, user_id: str) -> bool:
     """Persist three separate concepts correctly: meeting registry, reminder, follow-up.
 
@@ -589,11 +620,12 @@ async def inbox_fast(
 
     requested_bucket = (bucket or "FOCUS").upper()
     if requested_bucket in {"FOCUS", "IMPORTANT"}:
-        # Focus is the Brain's contextual attention ranking over recent Primary+Spam.
-        # No sender/domain/keyword/priority threshold decides importance here.
-        # Focus means the Brain's ranked answer to “what deserves attention now”.
-        # Do not require a fixed semantic bucket; return the requested number of
-        # highest-ranked recent Primary+Spam candidates.
+        # Focus is an attention dashboard, not All Mail. The Brain owns semantic
+        # classification; product routing simply keeps its low-value feed buckets
+        # in Updates/All Mail instead of consuming Focus slots. No sender/domain or
+        # keyword rule is used here.
+        low_value_feed_buckets = {"JOB_FEED", "MARKETING", "SOCIAL", "AUTOMATED_LOW_VALUE"}
+        out = [x for x in out if str(x.get("bucket") or "").upper() not in low_value_feed_buckets]
         out.sort(key=lambda x: (float(x.get("inbox_score", 0.0)), int(x.get("ts", 0))), reverse=True)
     elif requested_bucket == "NEEDS_REPLY":
         out = [x for x in out if x.get("respond_recommended") or str(x.get("reply_decision") or "").upper() == "DRAFT_REPLY"]
@@ -911,10 +943,13 @@ async def reply_generate(payload: Dict[str, Any] = Body(...)):
         # specific post-meeting action (e.g. apologize/reschedule), but the default
         # reply path must not claim they will attend a past event.
         scheduling = _is_scheduling_request(email, {**analysis, **result})
-        grounded_for_reply = extract_requested_time(email) if scheduling else None
+        grounded_for_reply = await _ground_calendar_time_for_reply(email, user_id) if scheduling else None
+        if scheduling and not grounded_for_reply:
+            grounded_for_reply = extract_requested_time(email)
         grounded_event_at = int((grounded_for_reply or {}).get("event_at_unix") or 0)
+        grounded_event_end = int((grounded_for_reply or {}).get("event_end_unix") or grounded_event_at)
         attendance_confirmation = str(user_preferences.get("attendance_confirmation") or "").strip().lower()
-        if scheduling and grounded_event_at and grounded_event_at < int(time.time()) and not attendance_confirmation:
+        if scheduling and grounded_event_end and grounded_event_end < int(time.time()) and not attendance_confirmation:
             result["decision"] = "ASK_USER"
             result["reply"] = ""
             result["should_reply"] = False
@@ -930,8 +965,8 @@ async def reply_generate(payload: Dict[str, Any] = Body(...)):
         # actual email text and use Calendar only to report conflicts.
         availability_confirmation = str(user_preferences.get("availability_confirmation") or "").strip().lower()
         scheduling = _is_scheduling_request(email, {**analysis, **result})
-        grounded_request = extract_requested_time(email) if scheduling else None
-        if scheduling and not availability_confirmation and grounded_request and int(grounded_request.get("event_at_unix") or 0) >= int(time.time()):
+        grounded_request = grounded_for_reply if scheduling else None
+        if scheduling and not availability_confirmation and grounded_request and int(grounded_request.get("event_at_unix") or 0) > int(time.time()):
             result["decision"] = "CHECK_CALENDAR"
             result["reply"] = ""
             result["should_reply"] = False
