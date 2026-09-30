@@ -378,13 +378,20 @@ function MeetingsPanel({ meetings, onRefresh }) {
       </div>
       {meetings.length === 0 && <div className="emptyState">No meetings detected yet.</div>}
       {meetings.map((m) => {
-        const past = Number(m.due_at || 0) > 0 && Number(m.due_at) < now;
+        const cancelled = String(m.state || "").toLowerCase() === "cancelled";
+        const eventEnd = Number(m.event_end_at || m.due_at || 0);
+        const past = !cancelled && eventEnd > 0 && eventEnd < now;
+        const lifecycle = cancelled
+          ? "Meeting canceled"
+          : past
+            ? "Meeting ended · attendance unknown"
+            : "Scheduled meeting";
         return (
-          <div key={`${m.email_id}-${m.kind}`} className={`followupRow ${past ? "past_unknown" : "pending"}`}>
+          <div key={`${m.email_id}-${m.kind}`} className={`followupRow ${cancelled ? "done" : past ? "past_unknown" : "pending"}`}>
             <div>
               <b>{m.title || "Meeting"}</b>
-              <p>{past ? "Meeting ended · attendance unknown" : "Scheduled meeting"}</p>
-              <small>{m.source_sender || "email"} • {fmtTime(m.due_at)}{m.timezone ? ` • ${m.timezone}` : ""}</small>
+              <p>{lifecycle}</p>
+              <small>{m.source_sender || "email"} • {fmtTime(m.due_at)} • your local time</small>
             </div>
           </div>
         );
@@ -892,22 +899,12 @@ export default function App() {
       const bucket = (it) => String(it?.bucket || "").toUpperCase();
 
       if (labelFilter === "FOCUS") {
-        const focusBuckets = new Set([
-          "IMPORTANT_NOW",
-          "CONVERSATIONAL",
-          "BUSINESS",
-          "RECRUITING",
-          "SECURITY",
-          "FOLLOW_UP",
-          "TRANSACTIONAL",
-        ]);
-        res = res.filter((it) =>
-          focusBuckets.has(bucket(it)) &&
-          (Number(it?.inbox_score || 0) >= 0.38 ||
-            it?.requires_action === true ||
-            it?.direct_human === true ||
-            it?.security_event === true)
-        );
+        // The backend Communication Brain already returns Focus in contextual
+        // attention order. Do not reinterpret that judgment with frontend
+        // buckets, numeric cutoffs, sender rules, or keyword rules.
+        // This also guarantees that requesting 10 does not collapse to 1-2
+        // merely because a second UI policy disagrees with the Brain.
+        res = res;
       } else if (labelFilter === "NEEDS_REPLY") {
         res = res.filter(
           (it) =>

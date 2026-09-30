@@ -5,6 +5,7 @@ import asyncio
 import time
 import threading
 import os
+import base64
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -40,9 +41,10 @@ try:
         update_followup_status,
         snooze_followup,
         suggest_followup_from_brain,
+        dismiss_meeting_reminders_for_thread,
     )
 except Exception:
-    from app.followup_service import create_followup, list_followups
+    from app.followup_service import create_followup, list_followups, dismiss_meeting_reminders_for_thread
     list_due_followups = None
     update_followup_status = None
     snooze_followup = None
@@ -93,12 +95,9 @@ def _ground_followup_time(email: Dict[str, Any], follow: Dict[str, Any], schedul
     event_at = int((grounded or {}).get("event_at_unix") or 0)
     llm_remind = int((follow or {}).get("remind_at_unix") or 0)
     if event_at > 0:
-        lead = max(0, min(int(os.getenv("MEETING_REMINDER_LEAD_SECONDS", "900")), 24 * 3600))
-        remind_at = event_at - lead
-        # If the advance reminder is already in the past, keep the actual event as the
-        # temporal anchor so it becomes due/missed correctly rather than inventing now+1h.
-        if remind_at <= 0:
-            remind_at = event_at
+        # Do not invent a universal "15 minutes before" reminder. A reminder time
+        # must come from communication intelligence / explicit calendar evidence.
+        remind_at = llm_remind if 0 < llm_remind <= event_at else 0
         return {
             "remind_at": remind_at,
             "event_at": event_at,
@@ -128,6 +127,47 @@ async def _persist_grounded_followup(email: Dict[str, Any], semantic: Dict[str, 
     scheduling = _is_scheduling_request(email, semantic)
     timing = _ground_followup_time(email, follow, scheduling=scheduling)
 
+    # Calendar MIME data is factual and takes precedence over prose/LLM timing.
+    # Gmail may expose an ICS either by attachmentId or inline body.data.
+    if scheduling:
+        for att in (email.get("attachments") or []):
+            filename = str(att.get("filename") or "").lower()
+            mime = str(att.get("mimeType") or att.get("mime_type") or "").lower()
+            if not (filename.endswith(".ics") or "text/calendar" in mime):
+                continue
+            data = b""
+            inline = str(att.get("inline_data") or "")
+            if inline:
+                try:
+                    data = base64.urlsafe_b64decode(inline + "=" * (-len(inline) % 4))
+                except Exception:
+                    data = b""
+            if not data:
+                aid = att.get("attachmentId") or att.get("attachment_id")
+                if aid:
+                    try:
+                        data = await asyncio.to_thread(fetch_gmail_attachment, str(email.get("id")), str(aid), user_id)
+                    except Exception as exc:
+                        print(f"Calendar attachment fetch warning for {email.get('id')}: {exc}")
+            parsed = extract_ics_time(data) if data else None
+            if parsed:
+                event_at = int(parsed.get("event_at_unix") or 0)
+                timing = {
+                    # Calendar time is factual; reminder timing is a separate
+                    # judgment. Preserve a grounded Brain reminder if one exists
+                    # rather than imposing a fixed lead time.
+                    "remind_at": int(timing.get("remind_at") or 0),
+                    "event_at": event_at,
+                    "event_end_at": int(parsed.get("event_end_unix") or event_at),
+                    "event_timezone": parsed.get("timezone") or "",
+                    "reminder_kind": "meeting",
+                    "requested_time": parsed,
+                    "event_uid": parsed.get("event_uid") or "",
+                    "cancelled": bool(parsed.get("cancelled")),
+                    "calendar_sequence": int(parsed.get("calendar_sequence") or 0),
+                }
+                break
+
     # Security/authentication notices are alerts, not overdue commitments by
     # default. They remain visible through Security/Inbox intelligence.
     intent = str(semantic.get("intent") or "").upper()
@@ -138,7 +178,9 @@ async def _persist_grounded_followup(email: Dict[str, Any], semantic: Dict[str, 
         await asyncio.to_thread(upsert_from_followup, user_id, email, timing, semantic, provider)
         # A meeting reminder is a reminder, not a Follow-up; it is stored in the
         # reminder table but filtered from the Follow-ups UI.
-        if int(timing.get("event_at") or 0) > int(time.time()):
+        if bool(timing.get("cancelled")):
+            await asyncio.to_thread(dismiss_meeting_reminders_for_thread, user_id, str(email.get("threadId") or ""))
+        elif int(timing.get("event_at") or 0) > int(time.time()) and int(timing.get("remind_at") or 0) > 0:
             await asyncio.to_thread(
                 create_followup, email.get("id", ""), timing["remind_at"],
                 follow.get("note") or f"Reminder for {email.get('subject') or 'meeting'}",
@@ -168,27 +210,90 @@ async def _persist_grounded_followup(email: Dict[str, Any], semantic: Dict[str, 
 
 
 async def _background_enrich_actionable_emails(emails: List[Dict[str, Any]], provider: str, user_id: str) -> None:
-    """Create meeting/deadline intelligence without requiring the user to open the email."""
+    """Ingest recent Gmail messages deeply without requiring a dashboard click.
+
+    Gmail's metadata format does not include MIME attachment structure, so an ICS
+    meeting can be invisible until the message is fetched with format=full. This
+    background pass fetches recent messages after the inbox response, persists the
+    richer metadata, and only invokes deeper Brain analysis when the message has
+    calendar evidence or the existing semantic result asks for temporal persistence.
+    """
     if provider != "gmail" or not user_id:
         return
     sem = asyncio.Semaphore(max(1, min(int(os.getenv("BACKGROUND_EMAIL_CONCURRENCY", "3")), 6)))
+
     async def one(card: Dict[str, Any]):
-        # The Communication Brain decides whether deeper temporal persistence is useful.
-        # Factual calendar attachments are also eligible because their event data is explicit.
-        has_ics = any(str(a.get("filename") or "").lower().endswith(".ics") or "text/calendar" in str(a.get("mimeType") or a.get("mime_type") or "").lower() for a in (card.get("attachments") or []))
-        if not (bool(card.get("meeting_related")) or bool(card.get("follow_up_needed")) or has_ics):
-            return
         async with sem:
             try:
                 full = await asyncio.to_thread(fetch_email_body, card.get("id"), user_id)
-                email = {**card, **full}
-                semantic = await asyncio.to_thread(analyze_message_semantics, email, card, thread=[], attachment_context=[])
-                await _persist_grounded_followup(email, semantic, provider, user_id)
+                # Persist full structural metadata (including ICS descriptors) so the
+                # Meetings surface can reconcile independently of the inbox UI.
+                await asyncio.to_thread(save_metadata, user_id, [full], "gmail")
+                has_ics = any(
+                    str(a.get("filename") or "").lower().endswith(".ics")
+                    or "text/calendar" in str(a.get("mimeType") or a.get("mime_type") or "").lower()
+                    for a in (full.get("attachments") or [])
+                )
+                existing = card.get("_semantic") or {}
+                if not (has_ics or bool(existing.get("meeting_related")) or bool(existing.get("follow_up_needed"))):
+                    return
+                semantic = await asyncio.to_thread(analyze_message_semantics, full, existing, thread=[], attachment_context=[])
+                if semantic.get("id"):
+                    await asyncio.to_thread(save_semantics, user_id, [semantic], "gmail")
+                await _persist_grounded_followup(full, semantic, provider, user_id)
             except Exception as exc:
                 print(f"Background intelligence warning for {card.get('id')}: {exc}")
+
     await asyncio.sleep(0.35)
-    temporal = [x for x in emails if bool(x.get("meeting_related")) or bool(x.get("follow_up_needed")) or any(str(a.get("filename") or "").lower().endswith(".ics") or "text/calendar" in str(a.get("mimeType") or a.get("mime_type") or "").lower() for a in (x.get("attachments") or []))][:40]
-    await asyncio.gather(*(one(x) for x in temporal), return_exceptions=True)
+    # Newest first, but keep separate messages even when they share a thread so a
+    # calendar cancellation/update can reconcile the original invitation by UID.
+    await asyncio.gather(*(one(x) for x in (emails or [])[:12]), return_exceptions=True)
+
+
+async def _background_sync_inbox_incremental(user_id: str, provider: str = "gmail", query: str = "") -> None:
+    """Refresh Neon without blocking inbox rendering.
+
+    The serving path reads the already-processed mailbox from Neon. This worker only
+    discovers a bounded recent Gmail ID window and processes IDs that Neon does not
+    already know. It deliberately does not re-fetch/re-analyze the whole mailbox.
+    """
+    if provider != "gmail" or not user_id:
+        return
+    try:
+        scan_limit = max(20, min(int(os.getenv("BACKGROUND_SYNC_DISCOVERY_LIMIT", "40")), 80))
+        discovered_ids = await asyncio.to_thread(
+            list_inbox_message_ids, _effective_query(query), scan_limit, user_id
+        )
+        if not discovered_ids:
+            return
+        persisted = await asyncio.to_thread(load_messages, user_id, discovered_ids, "gmail")
+        new_ids = [mid for mid in discovered_ids if mid not in persisted or not persisted[mid].get("metadata")]
+        await asyncio.to_thread(touch_messages, user_id, discovered_ids, "gmail")
+        if not new_ids:
+            return
+
+        # Metadata + one compact Brain pass only for genuinely new messages.
+        fresh = await asyncio.to_thread(fetch_message_metadata_batch, new_ids, user_id)
+        if not fresh:
+            return
+        await asyncio.to_thread(save_metadata, user_id, fresh, "gmail")
+        triaged = await asyncio.to_thread(triage_messages, fresh)
+        if triaged:
+            await asyncio.to_thread(save_semantics, user_id, [x for x in triaged if x.get("id")], "gmail")
+        triage_map = {str(x.get("id")): x for x in (triaged or []) if x.get("id")}
+
+        # Full MIME fetch is restricted to NEW messages only. This is needed to read
+        # factual ICS evidence that Gmail's metadata format omits; it is not a mailbox scan.
+        deep_cards = [{**m, "_semantic": triage_map.get(str(m.get("id")), {})} for m in fresh]
+        await _background_enrich_actionable_emails(deep_cards, "gmail", user_id)
+
+        # New data should be visible on the next refresh immediately.
+        with _ANALYZE_CACHE_LOCK:
+            for key in list(_ANALYZE_CACHE):
+                if f"|{user_id}|" in key:
+                    _ANALYZE_CACHE.pop(key, None)
+    except Exception as exc:
+        print(f"Incremental Gmail sync warning: {exc}")
 
 
 _ANALYZE_CACHE: Dict[str, Any] = {}
@@ -314,26 +419,44 @@ async def inbox_fast(
                 detail="Outlook is intentionally disabled until Microsoft OAuth is configured; app-password login is not supported.",
             )
         else:
-            # Latency path: Gmail list is cheap; Neon supplies metadata + semantic
-            # intelligence for messages we have already processed. Only genuinely new
-            # Gmail IDs require metadata fetch + Communication Brain work.
-            scan_limit = min(200, max(max_results * 5, 80))
-            discovered_ids = await asyncio.to_thread(
-                list_inbox_message_ids, _effective_query(query), scan_limit, user_id
+            # NEON-FIRST SERVING PATH: do not wait for Gmail or an LLM before rendering.
+            # Pull enough already-processed rows to let the Brain-ranked bucket return
+            # the requested count, then refresh Gmail independently in the background.
+            serve_from_neon = True
+            cached_rows = await asyncio.to_thread(
+                load_recent_messages, user_id, "gmail", max(80, min(max_results * 8, 200))
             )
-            # Keep the full bounded scan window. Filtering happens after semantic triage,
-            # so truncating before the requested bucket was the reason selecting 50
-            # could return only ~30 Focus messages even when more matches existed.
-            persisted = await asyncio.to_thread(load_messages, user_id, discovered_ids, "gmail")
-            missing_ids = [mid for mid in discovered_ids if mid not in persisted or not persisted[mid].get("metadata")]
-            fresh = []
-            if missing_ids:
-                fresh = await asyncio.to_thread(fetch_message_metadata_batch, missing_ids, user_id)
-                await asyncio.to_thread(save_metadata, user_id, fresh, "gmail")
-                for item in fresh:
-                    persisted[str(item.get("id"))] = {"metadata": item, "semantic": {}, "analysis_version": ""}
-            await asyncio.to_thread(touch_messages, user_id, discovered_ids, "gmail")
-            raw = [persisted[mid]["metadata"] for mid in discovered_ids if mid in persisted and persisted[mid].get("metadata")]
+            raw = []
+            persisted_semantics: Dict[str, Dict[str, Any]] = {}
+            for row in cached_rows:
+                clean = {k: v for k, v in row.items() if not str(k).startswith("_")}
+                if clean.get("id"):
+                    raw.append(clean)
+                    persisted_semantics[str(clean.get("id"))] = row.get("_semantic") or {}
+            all_recent_for_background = []
+
+            # Sync is intentionally detached from the response. Existing cards stay
+            # visible while only new Gmail IDs are discovered and processed.
+            try:
+                asyncio.create_task(_background_sync_inbox_incremental(user_id, provider, query))
+            except Exception as bg_sync_err:
+                print(f"Incremental sync scheduling warning: {bg_sync_err}")
+
+            # Empty Neon is a first-run/bootstrap case only. Fetch a small window so a
+            # new workspace is usable, but never perform the old 80-200 message scan.
+            if not raw:
+                discovered_ids = await asyncio.to_thread(
+                    list_inbox_message_ids, _effective_query(query), max(20, min(max_results * 2, 30)), user_id
+                )
+                fresh = await asyncio.to_thread(fetch_message_metadata_batch, discovered_ids, user_id) if discovered_ids else []
+                if fresh:
+                    await asyncio.to_thread(save_metadata, user_id, fresh, "gmail")
+                    triaged = await asyncio.to_thread(triage_messages, fresh)
+                    if triaged:
+                        await asyncio.to_thread(save_semantics, user_id, [x for x in triaged if x.get("id")], "gmail")
+                    sem_map = {str(x.get("id")): x for x in (triaged or []) if x.get("id")}
+                    raw = fresh
+                    persisted_semantics.update(sem_map)
     except HTTPException:
         raise
     except Exception as e:
@@ -353,7 +476,7 @@ async def inbox_fast(
     # what deserves space in the intelligent inbox. One compact batched call keeps
     # token/cost usage bounded while preventing newsletters/job feeds from crowding
     # out direct human and important messages.
-    triage_by_id: Dict[str, Dict[str, Any]] = {}
+    triage_by_id: Dict[str, Dict[str, Any]] = dict(locals().get("persisted_semantics", {}))
     if provider == "gmail" and candidates:
         try:
             # Reuse persisted Communication Brain output when the analysis contract
@@ -361,12 +484,20 @@ async def inbox_fast(
             persisted_now = await asyncio.to_thread(load_messages, user_id, [x.get("id") for x in candidates], "gmail")
             to_triage = []
             for item in candidates:
-                saved = persisted_now.get(str(item.get("id")), {})
+                item_id = str(item.get("id"))
+                if triage_by_id.get(item_id):
+                    continue
+                saved = persisted_now.get(item_id, {})
                 semantic = saved.get("semantic") or {}
-                if semantic and saved.get("analysis_version") == ANALYSIS_VERSION:
-                    triage_by_id[str(item.get("id"))] = semantic
+                if semantic:
+                    triage_by_id[item_id] = semantic
                 else:
                     to_triage.append(item)
+            # Never make the user wait for semantic enrichment of already-cached
+            # rows. Pending semantics can be repaired asynchronously; Focus still
+            # returns the requested recent candidates instead of collapsing to 1-2.
+            if locals().get("serve_from_neon"):
+                to_triage = []
             if to_triage:
                 triaged = await asyncio.to_thread(triage_messages, to_triage)
                 new_semantics = [x for x in triaged if x.get("id")]
@@ -435,13 +566,18 @@ async def inbox_fast(
     # Preserve the complete analyzed candidate set for background meeting/deadline
     # discovery. A meeting must not disappear from the Meetings registry merely
     # because the user is currently viewing another inbox bucket.
-    background_candidates = list(out)
+    background_candidates = []
+    for item in all_recent_for_background:
+        sem_saved = triage_by_id.get(str(item.get("id")), {})
+        background_candidates.append({**item, "_semantic": sem_saved})
 
     requested_bucket = (bucket or "FOCUS").upper()
     if requested_bucket in {"FOCUS", "IMPORTANT"}:
         # Focus is the Brain's contextual attention ranking over recent Primary+Spam.
         # No sender/domain/keyword/priority threshold decides importance here.
-        out = [x for x in out if str(x.get("bucket") or "").upper() == "IMPORTANT_NOW"]
+        # Focus means the Brain's ranked answer to “what deserves attention now”.
+        # Do not require a fixed semantic bucket; return the requested number of
+        # highest-ranked recent Primary+Spam candidates.
         out.sort(key=lambda x: (float(x.get("inbox_score", 0.0)), int(x.get("ts", 0))), reverse=True)
     elif requested_bucket == "NEEDS_REPLY":
         out = [x for x in out if x.get("respond_recommended") or str(x.get("reply_decision") or "").upper() == "DRAFT_REPLY"]
@@ -458,10 +594,6 @@ async def inbox_fast(
 
     out = out[:max_results]
     _cache_set(cache_key, out)
-    try:
-        asyncio.create_task(_background_enrich_actionable_emails(background_candidates, provider, user_id))
-    except Exception as bg_err:
-        print(f"Background intelligence scheduling warning: {bg_err}")
     return out
 
 
@@ -488,14 +620,21 @@ async def _reconcile_cached_meetings(user_id: str, limit: int = 180) -> None:
                 if not (str(att.get("filename") or "").lower().endswith(".ics") or "text/calendar" in str(att.get("mimeType") or att.get("mime_type") or "").lower()):
                     continue
                 aid = att.get("attachmentId") or att.get("attachment_id")
-                if not aid:
-                    continue
-                try:
-                    data = await asyncio.to_thread(fetch_gmail_attachment, str(card.get("id")), str(aid), user_id)
-                    timing = extract_ics_time(data) or timing
-                except Exception as exc:
-                    print(f"ICS meeting reconciliation warning for {card.get('id')}: {exc}")
-                if timing:
+                data = b""
+                inline = str(att.get("inline_data") or "")
+                if inline:
+                    try:
+                        data = base64.urlsafe_b64decode(inline + "=" * (-len(inline) % 4))
+                    except Exception:
+                        data = b""
+                if not data and aid:
+                    try:
+                        data = await asyncio.to_thread(fetch_gmail_attachment, str(card.get("id")), str(aid), user_id)
+                    except Exception as exc:
+                        print(f"ICS meeting reconciliation warning for {card.get('id')}: {exc}")
+                parsed = extract_ics_time(data) if data else None
+                if parsed:
+                    timing = parsed
                     break
         if not timing and semantic_meeting:
             try:
@@ -508,14 +647,22 @@ async def _reconcile_cached_meetings(user_id: str, limit: int = 180) -> None:
         normalized = {**sem, "meeting_related": True}
         grounded = {
             "event_at": int(timing["event_at_unix"]),
-            "remind_at": max(1, int(timing["event_at_unix"]) - max(0, min(int(os.getenv("MEETING_REMINDER_LEAD_SECONDS", "900")), 86400))),
+            "event_end_at": int(timing.get("event_end_unix") or timing["event_at_unix"]),
+            # Reconciliation never invents a reminder lead. Meeting persistence and
+            # reminder persistence are separate concerns.
+            "remind_at": 0,
             "event_timezone": timing.get("timezone") or "",
             "reminder_kind": "meeting",
             "requested_time": timing,
+            "event_uid": timing.get("event_uid") or "",
+            "cancelled": bool(timing.get("cancelled")),
+            "calendar_sequence": int(timing.get("calendar_sequence") or 0),
         }
         await asyncio.to_thread(upsert_from_followup, user_id, card, grounded, normalized, "gmail")
         # Keep reminder separate from meeting registry.
-        if int(grounded.get("event_at") or 0) > int(time.time()):
+        if bool(grounded.get("cancelled")):
+            await asyncio.to_thread(dismiss_meeting_reminders_for_thread, user_id, str(card.get("threadId") or ""))
+        elif int(grounded.get("event_at") or 0) > int(time.time()) and int(grounded.get("remind_at") or 0) > 0:
             try:
                 await asyncio.to_thread(create_followup, card.get("id", ""), grounded["remind_at"], f"Reminder for {card.get('subject') or 'meeting'}", card.get("threadId", ""), card.get("subject", ""), card.get("from", ""), "gmail", user_id, grounded["event_at"], grounded["event_timezone"], "meeting")
             except Exception as exc:
@@ -539,7 +686,8 @@ async def meetings(user_id: str = Query(default=""), limit: int = Query(default=
     for row in meetings_only:
         title_key = " ".join(str(row.get("title") or "").lower().split())
         sender_key = str(row.get("source_sender") or "").lower().strip()
-        key = (int(row.get("due_at") or 0), title_key, sender_key)
+        event_uid = str(row.get("event_uid") or "").strip()
+        key = ("uid", event_uid) if event_uid else ("fallback", int(row.get("due_at") or 0), title_key, sender_key)
         if key in seen:
             continue
         seen.add(key); deduped.append(row)

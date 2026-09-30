@@ -101,10 +101,10 @@ def get_analytics_summary(days: int = 14, user_id: str = "") -> Dict[str, Any]:
         intent_counts[intent] += 1
         sender_counts[_sender_domain(sender)] += 1
 
-        if label == "HIGH" or priority >= 0.70:
+        if label == "HIGH":
             high += 1
             daily[day]["high"] += 1
-        elif label == "MEDIUM" or priority >= 0.40:
+        elif label == "MEDIUM":
             medium += 1
         else:
             low += 1

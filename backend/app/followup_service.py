@@ -208,3 +208,15 @@ def suggest_followup_from_brain(brain_result: Dict[str, Any]) -> Dict[str, Any]:
         "note": follow.get("note") or "Follow up on this conversation.",
         "commitments": commitments,
     }
+
+
+def dismiss_meeting_reminders_for_thread(user_id: str, thread_id: str) -> None:
+    """Close pre-meeting reminders when a calendar update cancels the event."""
+    if not user_id or not thread_id:
+        return
+    conn=connect(); cur=conn.cursor(); now=_now()
+    cur.execute("""UPDATE followup_reminders SET status='dismissed',completed_at=?
+        WHERE user_id=? AND thread_id=? AND status IN ('pending','due','missed','past_unknown','snoozed')
+          AND LOWER(COALESCE(reminder_kind,'')) IN ('meeting','calendar','appointment')""",
+        (now,user_id,thread_id))
+    conn.commit(); conn.close()

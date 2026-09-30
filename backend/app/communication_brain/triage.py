@@ -176,15 +176,6 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 def _address_contains(header: Any, address: Any) -> bool:
     return bool(address) and str(address).lower() in str(header or "").lower()
 
-def _calibrate_priority(value: Any, *, security_event: bool = False, requires_action: bool = False) -> float:
-    p = _safe_float(value)
-    if security_event:
-        return round(max(0.82, min(0.96, 0.18 + 0.76 * p)), 3)
-    calibrated = 0.10 + 0.80 * p
-    if requires_action:
-        calibrated = max(calibrated, 0.58)
-    return round(max(0.05, min(0.94, calibrated)), 3)
-
 def _apply_deterministic_safety(item: Dict[str, Any], message: Dict[str, Any]) -> Dict[str, Any]:
     """Attach factual/safety evidence without replacing the Brain's semantic judgment."""
     account = str(message.get("authenticated_account_email") or "").strip().lower()
@@ -208,9 +199,12 @@ def _apply_deterministic_safety(item: Dict[str, Any], message: Dict[str, Any]) -
 
 def _normalize_item(raw: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
     priority = _safe_float(raw.get("priority"), 0.0)
+    # The model is the semantic authority for the qualitative label. Do not
+    # manufacture HIGH/MEDIUM/LOW from numeric thresholds. Structured output
+    # normally guarantees one of these values; malformed output stays pending.
     label = str(raw.get("label") or "").upper()
     if label not in {"HIGH", "MEDIUM", "LOW"}:
-        label = "HIGH" if priority >= 0.72 else "MEDIUM" if priority >= 0.40 else "LOW"
+        label = "PENDING"
 
     decision = str(raw.get("reply_decision") or "NO_REPLY").upper()
     if decision not in {"DRAFT_REPLY", "NO_REPLY", "ASK_USER", "ACTION_ONLY", "WAIT"}:
@@ -250,9 +244,9 @@ def _unavailable_item(original: Dict[str, Any]) -> Dict[str, Any]:
     """Conservative non-semantic fallback. Never pretends keyword rules are intelligence."""
     return {
         "id": str(original.get("id") or ""),
-        "inbox_score": 0.12,
-        "priority": 0.12,
-        "label": "LOW",
+        "inbox_score": 0.0,
+        "priority": 0.0,
+        "label": "PENDING",
         "bucket": "INFORMATIONAL",
         "communication_type": "AUTOMATED",
         "email_type": "UNCLASSIFIED",

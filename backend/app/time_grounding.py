@@ -145,6 +145,12 @@ def extract_ics_time(data: bytes | str) -> Optional[Dict[str, Any]]:
                     end_utc = enaive.replace(tzinfo=tz).astimezone(timezone.utc)
             except Exception:
                 pass
+        uid_m = re.search(r"^UID[:](?P<value>[^\r\n]+)", text, re.I | re.M)
+        method_m = re.search(r"^METHOD[:](?P<value>[^\r\n]+)", text, re.I | re.M)
+        status_m = re.search(r"^STATUS[:](?P<value>[^\r\n]+)", text, re.I | re.M)
+        sequence_m = re.search(r"^SEQUENCE[:](?P<value>\d+)", text, re.I | re.M)
+        method = str(method_m.group("value") if method_m else "").strip().upper()
+        status = str(status_m.group("value") if status_m else "").strip().upper()
         return {
             "event_at_unix": int(start_utc.timestamp()),
             "event_end_unix": int(end_utc.timestamp()),
@@ -154,6 +160,11 @@ def extract_ics_time(data: bytes | str) -> Optional[Dict[str, Any]]:
             "timezone_label": tzid or "UTC",
             "display": local.strftime("%Y-%m-%d %I:%M %p") + (f" {tzid}" if tzid else " UTC"),
             "source_text": m.group(0),
+            "event_uid": str(uid_m.group("value") if uid_m else "").strip(),
+            "calendar_method": method,
+            "calendar_status": status,
+            "calendar_sequence": int(sequence_m.group("value")) if sequence_m else 0,
+            "cancelled": method == "CANCEL" or status == "CANCELLED",
         }
     except Exception:
         return None

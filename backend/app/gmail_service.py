@@ -214,7 +214,8 @@ def _extract_attachments(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         mime_type = p.get("mimeType", "") or ""
         size = int(body.get("size", 0) or 0)
 
-        if filename and attachment_id:
+        inline_data = body.get("data") or ""
+        if filename and (attachment_id or inline_data):
             low_name = filename.strip().lower()
             low_mime = mime_type.strip().lower()
             # Do not surface provider-generated copies of the email body as documents.
@@ -232,7 +233,12 @@ def _extract_attachments(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "filename": filename,
                     "mime_type": mime_type,
                     "file_type": file_type,
-                    "attachment_id": attachment_id,
+                    "attachment_id": attachment_id or "",
+                    # Small iCalendar parts are sometimes embedded directly in the
+                    # Gmail MIME payload instead of receiving an attachmentId. Keep
+                    # only calendar inline bytes; ordinary attachment contents are
+                    # never persisted in inbox metadata.
+                    "inline_data": inline_data if (low_name.endswith(".ics") or "text/calendar" in low_mime) else "",
                     "size": size,
                     "risk_level": risk.get("risk_level", "low"),
                     "risk_score": risk.get("risk_score", 0.05),

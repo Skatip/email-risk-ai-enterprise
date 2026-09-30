@@ -2,11 +2,13 @@ from typing import Any, Dict
 
 
 def analyze_email_workflow(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Legacy/background entry point routed through the same Communication Brain.
+
+    There must not be a second keyword/score-based semantic engine for async jobs;
+    otherwise the dashboard and background persistence can disagree about meaning.
+    """
     from app.gmail_service import fetch_email_body
-    from app.priority_engine import priority_score
-    from app.utils import parse_sender
-    from app.learning import predict_user_preference, apply_user_override
-    from app.db import upsert_sender
+    from app.communication_brain.triage import analyze_message_semantics
     from app.analytics_service import track_email_event
 
     email = payload.get("email") or {}
@@ -22,54 +24,26 @@ def analyze_email_workflow(payload: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as body_err:
             print(f"Analyze body fetch warning: {body_err}")
 
-    po = priority_score(email)
-    name, sender_email = parse_sender(email.get("from", ""))
-    pref = predict_user_preference(sender_email, user_id=user_id)
-    new_p, new_label, new_rr = apply_user_override(
-        po.priority,
-        po.label,
-        po.respond_recommended,
-        pref,
+    semantic = analyze_message_semantics(
+        email,
+        payload.get("analysis") or {},
+        thread=payload.get("thread") or [],
+        attachment_context=payload.get("attachment_context") or email.get("attachment_analysis") or [],
     )
-
-    try:
-        upsert_sender(sender_email, name, new_p, new_label, int(email.get("ts", 0)))
-    except Exception:
-        pass
-
     item = {
         **email,
-        "priority": new_p,
-        "label": new_label,
-        "reason": po.reason,
-        "intent": po.intent,
-        "sender_band": po.sender_band,
-        "risk": po.risk,
-        "coherence": po.coherence,
-        "coherence_band": getattr(po, "coherence_band", None),
-        "respond_recommended": new_rr,
-        "user_pref": pref,
-        "urgency_minutes": getattr(po, "urgency_minutes", None),
-        "human_signals": getattr(po, "human_signals", None),
-        "risk_signals": (getattr(po, "human_signals", None) or {}).get("risk_signals", []),
-        "risk_reasons": (getattr(po, "human_signals", None) or {}).get("risk_reasons", []),
-        "risk_urls": (getattr(po, "human_signals", None) or {}).get("risk_urls", []),
+        **semantic,
         "provider": provider,
         "user_id": user_id,
         "analysis_status": "done",
         "source_folder": email.get("source_folder", ""),
-        "email_type": email.get("email_type", ""),
-        "relationship_type": email.get("relationship_type", ""),
-        "basic_classification": email.get("basic_classification", {}),
         "attachments": email.get("attachments", []),
         "has_attachments": bool(email.get("attachments", [])),
     }
-
     try:
         track_email_event(item)
     except Exception as track_err:
         print(f"Analytics track error: {track_err}")
-
     return item
 
 
