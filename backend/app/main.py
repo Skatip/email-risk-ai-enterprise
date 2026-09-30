@@ -269,23 +269,39 @@ async def _background_sync_inbox_incremental(user_id: str, provider: str = "gmai
         persisted = await asyncio.to_thread(load_messages, user_id, discovered_ids, "gmail")
         new_ids = [mid for mid in discovered_ids if mid not in persisted or not persisted[mid].get("metadata")]
         await asyncio.to_thread(touch_messages, user_id, discovered_ids, "gmail")
-        if not new_ids:
-            return
+
+        # Contract-version repair: keep serving cached Neon immediately, but repair a
+        # small bounded set of semantics produced by an older Brain contract. This is
+        # semantic migration, not sender/category/keyword hardcoding.
+        repair_limit = max(1, min(int(os.getenv("BACKGROUND_SEMANTIC_REPAIR_LIMIT", "12")), 24))
+        stale_ids = [
+            mid for mid in discovered_ids
+            if mid in persisted
+            and persisted[mid].get("metadata")
+            and persisted[mid].get("analysis_version") != ANALYSIS_VERSION
+        ][:repair_limit]
+        stale_cards = [persisted[mid]["metadata"] for mid in stale_ids]
+        repaired = await asyncio.to_thread(triage_messages, stale_cards) if stale_cards else []
+        if repaired:
+            await asyncio.to_thread(save_semantics, user_id, [x for x in repaired if x.get("id")], "gmail")
 
         # Metadata + one compact Brain pass only for genuinely new messages.
-        fresh = await asyncio.to_thread(fetch_message_metadata_batch, new_ids, user_id)
-        if not fresh:
-            return
-        await asyncio.to_thread(save_metadata, user_id, fresh, "gmail")
-        triaged = await asyncio.to_thread(triage_messages, fresh)
+        fresh = await asyncio.to_thread(fetch_message_metadata_batch, new_ids, user_id) if new_ids else []
+        if fresh:
+            await asyncio.to_thread(save_metadata, user_id, fresh, "gmail")
+        triaged = await asyncio.to_thread(triage_messages, fresh) if fresh else []
         if triaged:
             await asyncio.to_thread(save_semantics, user_id, [x for x in triaged if x.get("id")], "gmail")
         triage_map = {str(x.get("id")): x for x in (triaged or []) if x.get("id")}
 
         # Full MIME fetch is restricted to NEW messages only. This is needed to read
         # factual ICS evidence that Gmail's metadata format omits; it is not a mailbox scan.
-        deep_cards = [{**m, "_semantic": triage_map.get(str(m.get("id")), {})} for m in fresh]
-        await _background_enrich_actionable_emails(deep_cards, "gmail", user_id)
+        if fresh:
+            deep_cards = [{**m, "_semantic": triage_map.get(str(m.get("id")), {})} for m in fresh]
+            await _background_enrich_actionable_emails(deep_cards, "gmail", user_id)
+
+        if not fresh and not repaired:
+            return
 
         # New data should be visible on the next refresh immediately.
         with _ANALYZE_CACHE_LOCK:

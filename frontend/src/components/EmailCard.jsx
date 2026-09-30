@@ -137,9 +137,9 @@ function shouldOfferReply(item) {
 
 function replyButtonLabel(item, loadingDraft, hasDraft) {
   if (loadingDraft) return "Understanding...";
-  const isFinal = item?.analysis_status === "done";
   const decision = String(item?.reply_decision || item?.decision || "").toUpperCase();
-  if (!isFinal && ["NO_REPLY", "ASK_USER", "ACTION_ONLY", "WAIT", "PAST_EVENT"].includes(decision)) return "Check reply";
+  // A persisted/triaged Brain decision is already authoritative. Do not turn an
+  // explicit NO_REPLY/ACTION_ONLY/WAIT decision into the misleading “Check reply”.
   if (decision === "PAST_EVENT") return "Meeting ended";
   if (decision === "ASK_USER") return "Needs your input";
   if (decision === "ACTION_ONLY") return "Action only";
