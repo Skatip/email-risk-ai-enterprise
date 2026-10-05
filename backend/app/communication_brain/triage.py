@@ -215,6 +215,7 @@ def _normalize_item(raw: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, 
 
     item = {
         "id": str(raw.get("id") or fallback.get("id") or ""),
+        "semantic_status": "ready",
         "inbox_score": _safe_float(raw.get("inbox_score"), priority),
         "priority": priority,
         "label": label,
@@ -238,6 +239,23 @@ def _normalize_item(raw: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, 
         "follow_up_needed": bool(raw.get("follow_up_needed", False)),
     }
     return _apply_deterministic_safety(item, fallback)
+
+
+def is_usable_triage(item: Dict[str, Any] | None) -> bool:
+    """True only for a completed Brain triage result, never for transport/provider fallback.
+
+    This is a data-integrity check, not semantic classification. It prevents a temporary
+    AI outage from becoming persisted PENDING/UNCLASSIFIED intelligence.
+    """
+    if not isinstance(item, dict) or not item.get("id"):
+        return False
+    if str(item.get("semantic_status") or "").lower() == "unavailable":
+        return False
+    if str(item.get("label") or "").upper() == "PENDING" and str(item.get("email_type") or "").upper() == "UNCLASSIFIED":
+        return False
+    if "semantic triage was temporarily unavailable" in str(item.get("reason") or "").lower():
+        return False
+    return True
 
 
 def _unavailable_item(original: Dict[str, Any]) -> Dict[str, Any]:
@@ -265,6 +283,7 @@ def _unavailable_item(original: Dict[str, Any]) -> Dict[str, Any]:
         "confidence": 0.0,
         "meeting_related": False,
         "follow_up_needed": False,
+        "semantic_status": "unavailable",
     }
 
 

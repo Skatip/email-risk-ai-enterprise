@@ -17,7 +17,7 @@ from app.calendar_service import free_busy
 from app.time_grounding import extract_requested_time, extract_ics_time
 from app.reply_agent import save_rag_example, load_reply_memories
 from app.communication_brain.orchestrator import process_communication
-from app.communication_brain.triage import triage_messages, analyze_message_semantics
+from app.communication_brain.triage import triage_messages, analyze_message_semantics, is_usable_triage
 from app.api.google_oauth import router as google_oauth_router
 from app.api.mcp_tools import router as mcp_tools_router
 from app.integration_store import init_integration_store
@@ -309,12 +309,15 @@ async def _background_sync_inbox_incremental(user_id: str, provider: str = "gmai
             mid for mid in discovered_ids
             if mid in persisted
             and persisted[mid].get("metadata")
-            and persisted[mid].get("analysis_version") != ANALYSIS_VERSION
+            and (
+                persisted[mid].get("analysis_version") != ANALYSIS_VERSION
+                or not is_usable_triage(persisted[mid].get("semantic") or {})
+            )
         ][:repair_limit]
         stale_cards = [persisted[mid]["metadata"] for mid in stale_ids]
         repaired = await asyncio.to_thread(triage_messages, stale_cards) if stale_cards else []
         if repaired:
-            await asyncio.to_thread(save_semantics, user_id, [x for x in repaired if x.get("id")], "gmail")
+            await asyncio.to_thread(save_semantics, user_id, [x for x in repaired if is_usable_triage(x)], "gmail")
 
         # Metadata + one compact Brain pass only for genuinely new messages.
         fresh = await asyncio.to_thread(fetch_message_metadata_batch, new_ids, user_id) if new_ids else []
@@ -322,8 +325,8 @@ async def _background_sync_inbox_incremental(user_id: str, provider: str = "gmai
             await asyncio.to_thread(save_metadata, user_id, fresh, "gmail")
         triaged = await asyncio.to_thread(triage_messages, fresh) if fresh else []
         if triaged:
-            await asyncio.to_thread(save_semantics, user_id, [x for x in triaged if x.get("id")], "gmail")
-        triage_map = {str(x.get("id")): x for x in (triaged or []) if x.get("id")}
+            await asyncio.to_thread(save_semantics, user_id, [x for x in triaged if is_usable_triage(x)], "gmail")
+        triage_map = {str(x.get("id")): x for x in (triaged or []) if is_usable_triage(x)}
 
         # Full MIME fetch is restricted to NEW messages only. This is needed to read
         # factual ICS evidence that Gmail's metadata format omits; it is not a mailbox scan.
@@ -479,7 +482,9 @@ async def inbox_fast(
                 clean = {k: v for k, v in row.items() if not str(k).startswith("_")}
                 if clean.get("id"):
                     raw.append(clean)
-                    persisted_semantics[str(clean.get("id"))] = row.get("_semantic") or {}
+                    saved_semantic = row.get("_semantic") or {}
+                    if is_usable_triage(saved_semantic):
+                        persisted_semantics[str(clean.get("id"))] = saved_semantic
             all_recent_for_background = []
 
             # Sync is intentionally detached from the response. Existing cards stay
@@ -500,8 +505,8 @@ async def inbox_fast(
                     await asyncio.to_thread(save_metadata, user_id, fresh, "gmail")
                     triaged = await asyncio.to_thread(triage_messages, fresh)
                     if triaged:
-                        await asyncio.to_thread(save_semantics, user_id, [x for x in triaged if x.get("id")], "gmail")
-                    sem_map = {str(x.get("id")): x for x in (triaged or []) if x.get("id")}
+                        await asyncio.to_thread(save_semantics, user_id, [x for x in triaged if is_usable_triage(x)], "gmail")
+                    sem_map = {str(x.get("id")): x for x in (triaged or []) if is_usable_triage(x)}
                     raw = fresh
                     persisted_semantics.update(sem_map)
     except HTTPException:
@@ -536,7 +541,7 @@ async def inbox_fast(
                     continue
                 saved = persisted_now.get(item_id, {})
                 semantic = saved.get("semantic") or {}
-                if semantic:
+                if is_usable_triage(semantic):
                     triage_by_id[item_id] = semantic
                 else:
                     to_triage.append(item)
@@ -547,7 +552,7 @@ async def inbox_fast(
                 to_triage = []
             if to_triage:
                 triaged = await asyncio.to_thread(triage_messages, to_triage)
-                new_semantics = [x for x in triaged if x.get("id")]
+                new_semantics = [x for x in triaged if is_usable_triage(x)]
                 triage_by_id.update({str(x.get("id")): x for x in new_semantics})
                 await asyncio.to_thread(save_semantics, user_id, new_semantics, "gmail")
         except Exception as triage_err:
@@ -620,12 +625,9 @@ async def inbox_fast(
 
     requested_bucket = (bucket or "FOCUS").upper()
     if requested_bucket in {"FOCUS", "IMPORTANT"}:
-        # Focus is an attention dashboard, not All Mail. The Brain owns semantic
-        # classification; product routing simply keeps its low-value feed buckets
-        # in Updates/All Mail instead of consuming Focus slots. No sender/domain or
-        # keyword rule is used here.
-        low_value_feed_buckets = {"JOB_FEED", "MARKETING", "SOCIAL", "AUTOMATED_LOW_VALUE"}
-        out = [x for x in out if str(x.get("bucket") or "").upper() not in low_value_feed_buckets]
+        # Focus is ranked by the Unified Communication Brain's attention score.
+        # Do not hard-exclude semantic categories here: a normally low-value class
+        # can still matter in a specific context, and that judgment belongs to the Brain.
         out.sort(key=lambda x: (float(x.get("inbox_score", 0.0)), int(x.get("ts", 0))), reverse=True)
     elif requested_bucket == "NEEDS_REPLY":
         out = [x for x in out if x.get("respond_recommended") or str(x.get("reply_decision") or "").upper() == "DRAFT_REPLY"]
